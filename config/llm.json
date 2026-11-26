@@ -1,0 +1,14 @@
+{
+	"provider": "openai",
+	"model": "gpt-6-luna",
+	"effort": "low",
+	"thinkingHeadroom": 2800,
+	"outputCap": 16000,
+	"timeoutMs": 120000,
+	"spend": {
+		"limitUsd": 5,
+		"usdPerMillionTokens": {
+			"gpt-6-luna": { "input": 0.1, "cachedInput": 0.01, "output": 0.5 }
+		}
+	}
+}

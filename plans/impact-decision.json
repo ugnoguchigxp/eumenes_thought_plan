@@ -1,24 +1,33 @@
 {
 	"id": "impact-decision",
-	"version": 1,
+	"version": 3,
 	"description": "副作用のある操作の前に、選択肢ごとの影響と取り消せるかを見積もり、許された影響の範囲で一つ選ぶ。範囲を超える選択肢しかなければ確認を求める。",
 	"inputs": {
-		"situation": { "type": "string" },
+		"situation": {
+			"type": "string"
+		},
 		"options": {
 			"type": "array",
 			"minItems": 1,
 			"items": {
 				"type": "object",
 				"properties": {
-					"id": { "type": "string" },
-					"description": { "type": "string" }
+					"id": {
+						"type": "string"
+					},
+					"description": {
+						"type": "string"
+					}
 				},
 				"required": ["id", "description"]
 			}
 		},
 		"allowedEffects": {
 			"type": "array",
-			"items": { "enum": ["none", "local_files", "shared_state", "external"] }
+			"items": {
+				"enum": ["none", "local_files", "shared_state", "external"],
+				"description": "none は何も変えない。local_files は手元の作業ツリーやローカルのファイルだけを変える（共有の作業ツリーにあるファイルも含む）。shared_state は他の人やシステムが使う状態（共有データベース、リモートのブランチ、共有の設定）を変える。external は外部への送信や公開"
+			}
 		}
 	},
 	"stages": [
@@ -39,13 +48,22 @@
 						"items": {
 							"type": "object",
 							"properties": {
-								"optionId": { "type": "string" },
-								"effect": {
-									"enum": ["none", "local_files", "shared_state", "external"]
+								"optionId": {
+									"type": "string"
 								},
-								"scope": { "type": "string" },
-								"reversible": { "enum": ["yes", "partly", "no", "unknown"] },
-								"ifFails": { "type": "string" }
+								"effect": {
+									"enum": ["none", "local_files", "shared_state", "external"],
+									"description": "none は何も変えない。local_files は手元の作業ツリーやローカルのファイルだけを変える（共有の作業ツリーにあるファイルも含む）。shared_state は他の人やシステムが使う状態（共有データベース、リモートのブランチ、共有の設定）を変える。external は外部への送信や公開"
+								},
+								"scope": {
+									"type": "string"
+								},
+								"reversible": {
+									"enum": ["yes", "partly", "no", "unknown"]
+								},
+								"ifFails": {
+									"type": "string"
+								}
 							},
 							"required": [
 								"optionId",
@@ -65,7 +83,7 @@
 		{
 			"id": "choose",
 			"description": "選択",
-			"system": "許された影響の範囲に収まる選択肢から、目的を果たせて影響と取り消せなさが最も小さいものを選ぶ。範囲に収まる選択肢がなければ、選ばずに確認を求め、確認したい点を一つ書く。",
+			"system": "許された影響の範囲に収まる選択肢のうち、目的を果たせて、影響と取り消せなさが最も小さいものを選ぶ。前提に分からない点があっても、範囲に収まり目的を果たせる見込みがある選択肢があればそれを選び、不明点と注意は reason に書く。範囲に収まる選択肢が一つもないときだけ、選ばずに確認を求め、確認したい点を一つ書く。",
 			"input": {
 				"situation": "$.inputs.situation",
 				"allowedEffects": "$.inputs.allowedEffects",
@@ -74,10 +92,32 @@
 			"output": {
 				"type": "object",
 				"properties": {
-					"chosen": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
-					"needsConfirmation": { "type": "boolean" },
-					"confirm": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
-					"reason": { "type": "string" }
+					"chosen": {
+						"anyOf": [
+							{
+								"type": "string"
+							},
+							{
+								"type": "null"
+							}
+						]
+					},
+					"needsConfirmation": {
+						"type": "boolean"
+					},
+					"confirm": {
+						"anyOf": [
+							{
+								"type": "string"
+							},
+							{
+								"type": "null"
+							}
+						]
+					},
+					"reason": {
+						"type": "string"
+					}
 				},
 				"required": ["chosen", "needsConfirmation", "confirm", "reason"],
 				"additionalProperties": false

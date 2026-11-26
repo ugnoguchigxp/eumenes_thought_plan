@@ -1,0 +1,103 @@
+{
+	"id": "code-triage",
+	"version": 1,
+	"description": "不具合の報告を振り分ける。重大度と範囲を判定し、重大なものだけ原因の仮説と最初の確認を立て、報告者への返答と次の行動を決める。",
+	"inputs": {
+		"report": {
+			"type": "object",
+			"properties": {
+				"title": { "type": "string" },
+				"body": { "type": "string" }
+			},
+			"required": ["title", "body"]
+		},
+		"codeContext": {
+			"type": "string",
+			"description": "関係しそうなコードや構成の要約"
+		}
+	},
+	"stages": [
+		{
+			"id": "classify",
+			"description": "重大度と範囲の判定",
+			"system": "不具合の報告を読み、利用者への影響から重大度を判定する。critical は多くの利用者が主要な機能を使えないか、データが失われる場合。high は主要な機能が一部の条件で使えない場合。medium は回避策のある不具合。low は表示の誤りや軽微な不便。報告から再現できるかを判断し、影響する範囲を一文でまとめる。",
+			"input": {
+				"report": "$.inputs.report",
+				"codeContext": "$.inputs.codeContext"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"severity": { "enum": ["low", "medium", "high", "critical"] },
+					"area": { "type": "string" },
+					"reproducible": { "enum": ["yes", "no", "unknown"] },
+					"summary": { "type": "string" }
+				},
+				"required": ["severity", "area", "reproducible", "summary"],
+				"additionalProperties": false
+			}
+		},
+		{
+			"id": "investigate",
+			"description": "原因の仮説と最初の確認",
+			"system": "重大な不具合について、報告の観測とコードの要約から原因の仮説を挙げる。各仮説に、それを確かめる具体的な確認を書く。最も確からしく、最も早く確かめられる確認を最初の確認として選ぶ。",
+			"input": {
+				"report": "$.inputs.report",
+				"codeContext": "$.inputs.codeContext",
+				"classification": "$.stages.classify.output"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"hypotheses": {
+						"type": "array",
+						"minItems": 1,
+						"maxItems": 4,
+						"items": {
+							"type": "object",
+							"properties": {
+								"cause": { "type": "string" },
+								"check": { "type": "string" }
+							},
+							"required": ["cause", "check"],
+							"additionalProperties": false
+						}
+					},
+					"firstCheck": { "type": "string" }
+				},
+				"required": ["hypotheses", "firstCheck"],
+				"additionalProperties": false
+			},
+			"runWhen": {
+				"path": "$.stages.classify.output.severity",
+				"in": ["high", "critical"]
+			}
+		},
+		{
+			"id": "respond",
+			"description": "返答と次の行動",
+			"system": "判定と（あれば）調査の結果から、次の行動を一つ決め、報告者への短い返答を書く。重大なものはすぐ直す。再現に必要な情報が足りなければ報告者に聞く。軽微なものは予定に入れる。不具合でなければ閉じる。",
+			"input": {
+				"report": "$.inputs.report",
+				"classification": "$.stages.classify.output",
+				"investigation": "$.stages.investigate.output"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"nextAction": {
+						"enum": ["fix_now", "schedule", "ask_reporter", "close"]
+					},
+					"reply": { "type": "string" }
+				},
+				"required": ["nextAction", "reply"],
+				"additionalProperties": false
+			}
+		}
+	],
+	"outputs": {
+		"classification": "$.stages.classify.output",
+		"investigation": "$.stages.investigate.output",
+		"response": "$.stages.respond.output"
+	}
+}

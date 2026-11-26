@@ -103,6 +103,37 @@ claude mcp add thought-plan -- bun /path/to/eumenes_thought_plan/mcp/server.ts
 | `post-failure-reflection` | 観測の整理 → 原因の仮説 → 次に変える条件 |
 | `impact-decision` | 選択肢ごとの影響の見積もり → 許された範囲での選択 |
 
+## ChatGPT API で動かす
+
+`eumenes_agency` と同じく OpenAI の Responses API を使います（構造化出力の strict 形式、`store: false`）。モデル名・推論強度・費用の上限は `config/llm.json` に置き、コードには書きません。API キーはログインシェルが export した `OPEN_AI_API_KEY`（または `OPENAI_API_KEY`）から読み、ファイルには書きません。
+
+```ts
+import { createOpenAILlm, readLlmConfig } from "eumenes-thought-plan/openai";
+const llm = createOpenAILlm(readLlmConfig());
+```
+
+## examples
+
+`examples/` に、プランを実際の状況で回すシナリオを置いています。各シナリオは、どの段が動きどの段が省かれるべきかと、出力に対するチェックを持ちます。
+
+```sh
+bun run examples                       # config/llm.json のモデルで全シナリオ（最初の不合格で止まる）
+bun run examples -- --scenario live2d-goal-stalled
+bun run examples:fixture               # 各シナリオの固定の応答で、モデルなし
+```
+
+| シナリオ | プラン | 見ること |
+| --- | --- | --- |
+| `live2d-goal-stalled` | review-judge-plan | 同じ方法が8回失敗した直後に、繰り返しを認め、まだ試していない登録検査を変更なしの方法として選ぶ |
+| `live2d-goal-reflection` | post-failure-reflection | 入力上限による失敗を以前と同じ失敗と認め、同じ依頼をそのまま再送しない |
+| `live2d-goal-on-plan` | review-judge-plan | 計画どおりなら推論0回 |
+| `goal-without-means` | review-judge-plan | 手段がなければ続けず、聞くか待つ |
+| `readme-command-failed` / `readme-first-plan` | plan-execute-replan | 失敗後は対応する形式を確かめる計画に立て直す。初回は照合を省く |
+| `impact-undo-own-changes` / `impact-outside-limits` | impact-decision | 作業ツリー全体を消す手を選ばない。許可の外しかなければ確認を求める |
+| `triage-crash` / `triage-typo` | code-triage（`examples/plans/`） | 重大なら調査の段を通り、軽微なら省く |
+
+結果は `data/examples/report-*.json` と台帳（`data/examples.sqlite`）に残ります。
+
 ## 台帳
 
 | 表 | 内容 |

@@ -1,14 +1,20 @@
 {
 	"id": "review-judge-plan",
-	"version": 1,
+	"version": 3,
 	"description": "継続中の目標について、前回までの経過を振り返り、続けるか判断し、続けるなら方法の候補と影響を見積もって一つ選ぶ。前の手が成功し、計画が残り、前提が変わっていなければ考える段を省く（decision は null になり、利用側は計画の次の手へ進む）。",
 	"schemas": {
 		"criterion": {
 			"type": "object",
 			"properties": {
-				"id": { "type": "string" },
-				"text": { "type": "string" },
-				"status": { "enum": ["open", "passed"] }
+				"id": {
+					"type": "string"
+				},
+				"text": {
+					"type": "string"
+				},
+				"status": {
+					"enum": ["open", "passed"]
+				}
 			},
 			"required": ["id", "text", "status"],
 			"additionalProperties": false
@@ -16,20 +22,37 @@
 		"attempt": {
 			"type": "object",
 			"properties": {
-				"approach": { "type": "string" },
+				"approach": {
+					"type": "string"
+				},
 				"outcome": {
 					"enum": ["succeeded", "partial", "failed", "rejected", "cancelled"]
 				},
-				"observed": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+				"observed": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
 			},
 			"required": ["approach", "outcome", "observed"]
 		},
 		"capability": {
 			"type": "object",
 			"properties": {
-				"ref": { "type": "string" },
-				"description": { "type": "string" },
-				"effect": { "enum": ["read", "write", "external"] }
+				"ref": {
+					"type": "string"
+				},
+				"description": {
+					"type": "string"
+				},
+				"effect": {
+					"enum": ["read", "write", "external"]
+				}
 			},
 			"required": ["ref", "description", "effect"]
 		},
@@ -38,13 +61,17 @@
 			"properties": {
 				"done": {
 					"type": "array",
-					"items": { "type": "string" },
+					"items": {
+						"type": "string"
+					},
 					"maxItems": 12,
 					"description": "これまでに実際に行ったこと"
 				},
 				"learned": {
 					"type": "array",
-					"items": { "type": "string" },
+					"items": {
+						"type": "string"
+					},
 					"maxItems": 12,
 					"description": "観測から分かったこと"
 				},
@@ -54,9 +81,16 @@
 					"items": {
 						"type": "object",
 						"properties": {
-							"approach": { "type": "string" },
-							"count": { "type": "integer", "minimum": 1 },
-							"cause": { "type": "string" }
+							"approach": {
+								"type": "string"
+							},
+							"count": {
+								"type": "integer",
+								"minimum": 1
+							},
+							"cause": {
+								"type": "string"
+							}
 						},
 						"required": ["approach", "count", "cause"],
 						"additionalProperties": false
@@ -64,15 +98,21 @@
 				},
 				"changedSinceLast": {
 					"type": "array",
-					"items": { "type": "string" },
+					"items": {
+						"type": "string"
+					},
 					"maxItems": 8
 				},
-				"decision": { "enum": ["continue", "wait", "ask", "withdraw"] },
+				"decision": {
+					"enum": ["continue", "wait", "ask", "withdraw"]
+				},
 				"keepPlan": {
 					"type": "boolean",
-					"description": "残りの計画がまだ有効で、考え直さずに次の手へ進めるとき true"
+					"description": "残りの計画がまだ有効で、考え直さずに次の手へ進めるとき true。残りの計画がないときは false"
 				},
-				"reason": { "type": "string" },
+				"reason": {
+					"type": "string"
+				},
 				"wait": {
 					"anyOf": [
 						{
@@ -82,16 +122,28 @@
 									"type": "string",
 									"description": "待つ対象と成立条件"
 								},
-								"recheckAfterMinutes": { "type": "integer", "minimum": 1 }
+								"recheckAfterMinutes": {
+									"type": "integer",
+									"minimum": 1
+								}
 							},
 							"required": ["until", "recheckAfterMinutes"],
 							"additionalProperties": false
 						},
-						{ "type": "null" }
+						{
+							"type": "null"
+						}
 					]
 				},
 				"question": {
-					"anyOf": [{ "type": "string" }, { "type": "null" }],
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					],
 					"description": "本人にしか解けない一点"
 				}
 			},
@@ -118,7 +170,9 @@
 					"items": {
 						"type": "object",
 						"properties": {
-							"approach": { "type": "string" },
+							"approach": {
+								"type": "string"
+							},
 							"steps": {
 								"type": "array",
 								"minItems": 1,
@@ -126,8 +180,12 @@
 								"items": {
 									"type": "object",
 									"properties": {
-										"capabilityRef": { "type": "string" },
-										"request": { "type": "string" },
+										"capabilityRef": {
+											"type": "string"
+										},
+										"request": {
+											"type": "string"
+										},
 										"proceedWhen": {
 											"type": "string",
 											"description": "何が観測できれば次の手へ進むか"
@@ -140,11 +198,23 @@
 							"impact": {
 								"type": "object",
 								"properties": {
-									"changes": { "enum": ["none", "files", "external"] },
-									"reversible": { "type": "boolean" },
-									"inferenceCalls": { "type": "integer", "minimum": 0 },
-									"minutes": { "type": "number", "minimum": 0 },
-									"ifFails": { "type": "string" }
+									"changes": {
+										"enum": ["none", "files", "external"]
+									},
+									"reversible": {
+										"type": "boolean"
+									},
+									"inferenceCalls": {
+										"type": "integer",
+										"minimum": 0
+									},
+									"minutes": {
+										"type": "number",
+										"minimum": 0
+									},
+									"ifFails": {
+										"type": "string"
+									}
 								},
 								"required": [
 									"changes",
@@ -160,8 +230,14 @@
 						"additionalProperties": false
 					}
 				},
-				"chosen": { "type": "integer", "minimum": 0, "maximum": 2 },
-				"reason": { "type": "string" }
+				"chosen": {
+					"type": "integer",
+					"minimum": 0,
+					"maximum": 2
+				},
+				"reason": {
+					"type": "string"
+				}
 			},
 			"required": ["candidates", "chosen", "reason"],
 			"additionalProperties": false
@@ -171,10 +247,14 @@
 		"goal": {
 			"type": "object",
 			"properties": {
-				"text": { "type": "string" },
+				"text": {
+					"type": "string"
+				},
 				"criteria": {
 					"type": "array",
-					"items": { "$ref": "#/schemas/criterion" }
+					"items": {
+						"$ref": "#/schemas/criterion"
+					}
 				}
 			},
 			"required": ["text", "criteria"]
@@ -184,7 +264,9 @@
 			"properties": {
 				"attempts": {
 					"type": "array",
-					"items": { "$ref": "#/schemas/attempt" }
+					"items": {
+						"$ref": "#/schemas/attempt"
+					}
 				},
 				"lastOutcome": {
 					"enum": [
@@ -196,12 +278,19 @@
 						"cancelled"
 					]
 				},
-				"planRemaining": { "type": "boolean" },
+				"planRemaining": {
+					"type": "boolean"
+				},
 				"changed": {
 					"type": "boolean",
 					"description": "前回から許可・能力・資料が変わったか"
 				},
-				"changes": { "type": "array", "items": { "type": "string" } }
+				"changes": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
 			},
 			"required": [
 				"attempts",
@@ -213,25 +302,38 @@
 		},
 		"capabilities": {
 			"type": "array",
-			"items": { "$ref": "#/schemas/capability" }
+			"items": {
+				"$ref": "#/schemas/capability"
+			}
 		}
 	},
 	"stages": [
 		{
 			"id": "review",
 			"description": "振り返りと継続の判断",
-			"system": "登録された目標の経過を振り返る。試行と観測だけを根拠に、これまでに行ったこと、分かったこと、失敗した方法とその原因、前回から変わったことをまとめる。そのうえで続けるかを判断する。新しい根拠なしに同じ方法が繰り返し失敗しているなら、その方法で続けると判断しない。待つときは待つ対象と見直す時期を、本人に聞くときは本人にしか解けない一点を示す。元の達成条件は変えない。",
+			"system": "登録された目標の経過を振り返る。試行と観測だけを根拠に、これまでに行ったこと、分かったこと、失敗した方法とその原因、前回から変わったことをまとめる。そのうえで続けるかを判断する。新しい根拠なしに同じ方法が繰り返し失敗しているなら、その方法で続けると判断しない。失敗の原因がその方法で使った手段の制約なら、その制約は提示された別の能力には当てはまらない。失敗した方法と違う能力が提示されていれば、それはまだ試していない方法であり、それで続けられる。続けられる手がないときだけ、待つ対象と見直す時期を示して待つか、本人にしか解けない一点を聞く。元の達成条件は変えない。",
 			"input": {
 				"goal": "$.inputs.goal",
 				"history": "$.inputs.history",
 				"capabilities": "$.inputs.capabilities"
 			},
-			"output": { "$ref": "#/schemas/review" },
+			"output": {
+				"$ref": "#/schemas/review"
+			},
 			"skipWhen": {
 				"all": [
-					{ "path": "$.inputs.history.lastOutcome", "equals": "succeeded" },
-					{ "path": "$.inputs.history.planRemaining", "equals": true },
-					{ "path": "$.inputs.history.changed", "equals": false }
+					{
+						"path": "$.inputs.history.lastOutcome",
+						"equals": "succeeded"
+					},
+					{
+						"path": "$.inputs.history.planRemaining",
+						"equals": true
+					},
+					{
+						"path": "$.inputs.history.changed",
+						"equals": false
+					}
 				]
 			},
 			"maxOutputTokens": 2400
@@ -245,11 +347,27 @@
 				"review": "$.stages.review.output",
 				"capabilities": "$.inputs.capabilities"
 			},
-			"output": { "$ref": "#/schemas/plan" },
+			"output": {
+				"$ref": "#/schemas/plan"
+			},
 			"runWhen": {
 				"all": [
-					{ "path": "$.stages.review.output.decision", "equals": "continue" },
-					{ "path": "$.stages.review.output.keepPlan", "equals": false }
+					{
+						"path": "$.stages.review.output.decision",
+						"equals": "continue"
+					},
+					{
+						"any": [
+							{
+								"path": "$.stages.review.output.keepPlan",
+								"equals": false
+							},
+							{
+								"path": "$.inputs.history.planRemaining",
+								"equals": false
+							}
+						]
+					}
 				]
 			},
 			"maxOutputTokens": 3200
