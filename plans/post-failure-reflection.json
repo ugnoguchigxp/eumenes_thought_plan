@@ -1,15 +1,23 @@
 {
 	"id": "post-failure-reflection",
-	"version": 1,
+	"version": 2,
 	"description": "失敗の直後に、観測を整理し、原因の仮説を立て、次に変える条件と避ける方法を決める。同じ手を考えずに繰り返さないための振り返り。",
 	"inputs": {
 		"attempt": {
 			"type": "object",
 			"properties": {
-				"approach": { "type": "string" },
-				"request": { "type": "string" },
-				"observed": { "type": "string" },
-				"outcome": { "enum": ["partial", "failed", "rejected"] }
+				"approach": {
+					"type": "string"
+				},
+				"request": {
+					"type": "string"
+				},
+				"observed": {
+					"type": "string"
+				},
+				"outcome": {
+					"enum": ["partial", "failed", "rejected"]
+				}
 			},
 			"required": ["approach", "request", "observed", "outcome"]
 		},
@@ -18,10 +26,30 @@
 			"items": {
 				"type": "object",
 				"properties": {
-					"approach": { "type": "string" },
-					"observed": { "type": "string" }
+					"approach": {
+						"type": "string"
+					},
+					"observed": {
+						"type": "string"
+					}
 				},
 				"required": ["approach", "observed"]
+			}
+		},
+		"controls": {
+			"type": "array",
+			"description": "依頼側が次の試行で変えられるもの",
+			"items": {
+				"type": "object",
+				"properties": {
+					"id": {
+						"type": "string"
+					},
+					"description": {
+						"type": "string"
+					}
+				},
+				"required": ["id", "description"]
 			}
 		}
 	},
@@ -30,21 +58,30 @@
 			"id": "observe",
 			"description": "観測の整理",
 			"system": "失敗した試行で実際に観測された事実と、観測されていない未確認の点を分けて列挙する。推測は事実に含めない。以前の試行と同じ観測があれば対応付ける。",
-			"input": { "attempt": "$.inputs.attempt", "earlier": "$.inputs.earlier" },
+			"input": {
+				"attempt": "$.inputs.attempt",
+				"earlier": "$.inputs.earlier"
+			},
 			"output": {
 				"type": "object",
 				"properties": {
 					"facts": {
 						"type": "array",
-						"items": { "type": "string" },
+						"items": {
+							"type": "string"
+						},
 						"maxItems": 12
 					},
 					"unknowns": {
 						"type": "array",
-						"items": { "type": "string" },
+						"items": {
+							"type": "string"
+						},
 						"maxItems": 8
 					},
-					"repeatsEarlier": { "type": "boolean" }
+					"repeatsEarlier": {
+						"type": "boolean"
+					}
 				},
 				"required": ["facts", "unknowns", "repeatsEarlier"],
 				"additionalProperties": false
@@ -68,10 +105,21 @@
 						"items": {
 							"type": "object",
 							"properties": {
-								"cause": { "type": "string" },
-								"support": { "type": "array", "items": { "type": "string" } },
-								"check": { "type": "string" },
-								"likelihood": { "enum": ["high", "medium", "low"] }
+								"cause": {
+									"type": "string"
+								},
+								"support": {
+									"type": "array",
+									"items": {
+										"type": "string"
+									}
+								},
+								"check": {
+									"type": "string"
+								},
+								"likelihood": {
+									"enum": ["high", "medium", "low"]
+								}
 							},
 							"required": ["cause", "support", "check", "likelihood"],
 							"additionalProperties": false
@@ -85,27 +133,70 @@
 		{
 			"id": "change",
 			"description": "次に変える条件",
-			"system": "仮説をもとに、次の試行で変える条件と、避ける方法を決める。同じ方法をもう一度使ってよいのは、変える条件があるときだけにする。仮説を確かめる手が先に必要なら、それを次の手にする。",
+			"system": "仮説をもとに、次の試行で変える条件と、避ける方法を決める。変える条件は、依頼側が変えられるもの（controls）の中から一つ選び、どう変えるかを書く。controls の中に原因に効くものがなければ change は null にし、同じ方法の再使用を許さない。仮説を確かめる手が先に必要なら、それを次の手にする。",
 			"input": {
 				"attempt": "$.inputs.attempt",
 				"observation": "$.stages.observe.output",
-				"hypotheses": "$.stages.hypothesize.output.hypotheses"
+				"hypotheses": "$.stages.hypothesize.output.hypotheses",
+				"controls": "$.inputs.controls"
 			},
 			"output": {
 				"type": "object",
 				"properties": {
-					"change": { "type": "string" },
+					"change": {
+						"anyOf": [
+							{
+								"type": "object",
+								"properties": {
+									"controlId": {
+										"type": "string"
+									},
+									"to": {
+										"type": "string"
+									}
+								},
+								"required": ["controlId", "to"],
+								"additionalProperties": false
+							},
+							{
+								"type": "null"
+							}
+						],
+						"description": "次の試行で変える条件。変えられるものがなければ null"
+					},
 					"avoid": {
 						"type": "array",
-						"items": { "type": "string" },
+						"items": {
+							"type": "string"
+						},
 						"maxItems": 6
 					},
-					"sameApproachAllowed": { "type": "boolean" },
-					"nextStep": { "type": "string" }
+					"sameApproachAllowed": {
+						"type": "boolean"
+					},
+					"nextStep": {
+						"type": "string"
+					}
 				},
 				"required": ["change", "avoid", "sameApproachAllowed", "nextStep"],
 				"additionalProperties": false
-			}
+			},
+			"ensure": [
+				{
+					"when": {
+						"path": "$.output.sameApproachAllowed",
+						"equals": true
+					},
+					"require": {
+						"path": "$.output.change",
+						"exists": true
+					}
+				},
+				{
+					"each": "$.output.change.controlId",
+					"in": "$.inputs.controls[*].id"
+				}
+			]
 		}
 	],
 	"outputs": {

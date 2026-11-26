@@ -5,9 +5,20 @@ import type { Ledger } from "../src/ledger";
 import type { LoadedPlan } from "../src/plan";
 import { createStepRunner } from "../src/run";
 import { inlineRefs } from "../src/schema";
+import { loadPlan } from "../src/plan";
+import { version as packageVersion } from "../package.json";
 
 export const SERVER_NAME = "eumenes-thought-plan";
-export const SERVER_VERSION = "0.1.0";
+export const SERVER_VERSION = packageVersion;
+/** The largest `inputs` / `output` a caller may pass, as JSON characters. */
+export const PAYLOAD_LIMIT = 256_000;
+
+/** A plan file of a configured directory that could not be loaded; the server runs without it. */
+export type InvalidPlan = {
+	readonly file: string;
+	readonly code: string;
+	readonly where: string;
+};
 
 /** The newest version of each plan id, plus every version by `id@version`. */
 function catalog(plans: readonly LoadedPlan[]) {
@@ -26,7 +37,12 @@ function catalog(plans: readonly LoadedPlan[]) {
 /** The plan as a caller reads it: schemas inlined, conditions as written in the document. */
 function describe(plan: LoadedPlan) {
 	const document = plan.document as {
-		stages: { runWhen?: unknown; skipWhen?: unknown; input?: unknown }[];
+		stages: {
+			runWhen?: unknown;
+			skipWhen?: unknown;
+			ensure?: unknown;
+			input?: unknown;
+		}[];
 		outputs: unknown;
 	};
 	return {
@@ -46,6 +62,8 @@ function describe(plan: LoadedPlan) {
 			input: document.stages[i]?.input ?? {},
 			runWhen: document.stages[i]?.runWhen ?? null,
 			skipWhen: document.stages[i]?.skipWhen ?? null,
+			ensure: document.stages[i]?.ensure ?? [],
+			maxInputCharacters: stage.maxInputCharacters,
 			outputSchema: inlineRefs(stage.output, plan.schemas),
 		})),
 		outputs: document.outputs,
@@ -71,6 +89,8 @@ function caught(error: unknown) {
 }
 
 const json = z.unknown();
+const oversized = (value: unknown) =>
+	(JSON.stringify(value) ?? "").length > PAYLOAD_LIMIT;
 
 /**
  * The MCP server. It does not call a model: the calling agent thinks each stage out itself and submits the
@@ -79,6 +99,7 @@ const json = z.unknown();
 export function createThoughtPlanServer(input: {
 	readonly plans: readonly LoadedPlan[];
 	readonly ledger: Ledger;
+	readonly invalid?: readonly InvalidPlan[];
 }) {
 	const find = catalog(input.plans);
 	const runner = createStepRunner({ ledger: input.ledger });
@@ -92,8 +113,8 @@ export function createThoughtPlanServer(input: {
 			inputSchema: z.object({}).strict(),
 		},
 		async () =>
-			text(
-				[...new Set(input.plans.map(({ id }) => id))].map((id) => {
+			text({
+				plans: [...new Set(input.plans.map(({ id }) => id))].map((id) => {
 					const plan = find(id)!;
 					return {
 						id: plan.id,
@@ -101,7 +122,27 @@ export function createThoughtPlanServer(input: {
 						description: plan.description,
 					};
 				}),
-			),
+				invalid: input.invalid ?? [],
+			}),
+	);
+
+	server.registerTool(
+		"check_plan",
+		{
+			description:
+				"Check a plan document you are writing, without running it: returns its inputs, stages and skip conditions when it loads, or the fault's code and place.",
+			inputSchema: z.object({ document: json }).strict(),
+		},
+		async ({ document }) => {
+			if (oversized(document)) return failure("payload_too_large");
+			try {
+				return text({ ok: true, plan: describe(loadPlan(document)) });
+			} catch (error) {
+				return error instanceof PlanError
+					? text({ ok: false, code: error.code, where: error.where })
+					: caught(error);
+			}
+		},
 	);
 
 	server.registerTool(
@@ -139,6 +180,7 @@ export function createThoughtPlanServer(input: {
 		async ({ planId, version, inputs, subjectRef }) => {
 			const plan = find(planId, version);
 			if (!plan) return failure("plan_unknown", planId);
+			if (oversized(inputs)) return failure("payload_too_large");
 			try {
 				return text(
 					await runner.start(plan, inputs, { subjectRef: subjectRef ?? null }),
@@ -163,6 +205,7 @@ export function createThoughtPlanServer(input: {
 				.strict(),
 		},
 		async ({ runId, stageId, output }) => {
+			if (oversized(output)) return failure("payload_too_large");
 			try {
 				return text(await runner.submit(runId, stageId, output));
 			} catch (error) {
@@ -182,9 +225,18 @@ export function createThoughtPlanServer(input: {
 			try {
 				const view = await runner.view(runId);
 				const recorded = input.ledger.readRun(runId);
+				// What a model answered unusably stays in the ledger; a caller sees only that the stage failed.
 				return text(
 					recorded
-						? { view, run: recorded.run, stages: recorded.stages }
+						? {
+								view,
+								run: recorded.run,
+								stages: recorded.stages.map((stage) =>
+									stage.status === "failed"
+										? { ...stage, output: null }
+										: stage,
+								),
+							}
 						: { view },
 				);
 			} catch (error) {
@@ -215,7 +267,14 @@ export function createThoughtPlanServer(input: {
 							...(subjectRef !== undefined && { subjectRef }),
 							...(limit !== undefined && { limit }),
 						})
-						.map(({ inputs: _inputs, outputs: _outputs, ...run }) => run),
+						.map(
+							({
+								inputs: _inputs,
+								outputs: _outputs,
+								context: _context,
+								...run
+							}) => run,
+						),
 				);
 			} catch (error) {
 				return caught(error);

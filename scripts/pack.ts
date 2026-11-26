@@ -50,6 +50,9 @@ for (const required of [
 ])
 	if (!listing.includes(required))
 		throw new Error(`pack_file_missing:${required}`);
+// The model settings are for running this package alone; a host brings its own.
+if (listing.includes("package/config/llm.json"))
+	throw new Error("pack_file_unexpected:package/config/llm.json");
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
 	name: string;
 	version: string;

@@ -109,3 +109,68 @@ test("each call is stateless and carries its stage's prompt-cache key; cached in
 	expect(sent[0]).toMatchObject({ store: false, model: config.model });
 	expect(sent[0]).not.toHaveProperty("previous_response_id");
 });
+
+test("measurement aggregates repeated runs per scenario with the plan version", async () => {
+	const { summarize } = await import("../examples/run");
+	const scenario = scenarios.find(({ id }) => id === "triage-typo")!;
+	const plan = planOf(scenario, plans);
+	const reports = await Promise.all(
+		[0, 1, 2].map(() =>
+			runScenario(scenario, {
+				plan,
+				llm: fixtureLlm(scenario, plan),
+				ledger: createLedger(openLedgerStore(":memory:")),
+			}),
+		),
+	);
+	const failing = {
+		...reports[0]!,
+		ok: false,
+		checks: [{ name: "閉じない", ok: false, detail: "" }],
+	};
+	expect(summarize(scenario, plan, [...reports, failing])).toMatchObject({
+		id: "triage-typo",
+		set: "tuning",
+		plan: { id: "code-triage", version: 1, digest: plan.digest },
+		runs: 4,
+		passed: 3,
+		failedChecks: { 閉じない: 1 },
+		modelCalls: 8,
+	});
+});
+
+test("scenarios are split into a tuning set and a held-out set", () => {
+	const count = (set: string) => scenarios.filter((s) => s.set === set).length;
+	expect(count("tuning")).toBe(10);
+	expect(count("heldout")).toBe(12);
+	expect(new Set(scenarios.map(({ id }) => id)).size).toBe(scenarios.length);
+});
+
+test("runs the model never answered are reported apart, not counted as plan failures", async () => {
+	const { summarize } = await import("../examples/run");
+	const scenario = scenarios.find(({ id }) => id === "triage-typo")!;
+	const plan = planOf(scenario, plans);
+	const ok = await runScenario(scenario, {
+		plan,
+		llm: fixtureLlm(scenario, plan),
+		ledger: createLedger(openLedgerStore(":memory:")),
+	});
+	const limited = await runScenario(scenario, {
+		plan,
+		llm: {
+			async complete() {
+				throw Object.assign(new Error("x"), {
+					code: "llm_spend_limit",
+					retryable: false,
+				});
+			},
+		},
+		ledger: createLedger(openLedgerStore(":memory:")),
+	});
+	expect(summarize(scenario, plan, [ok, limited])).toMatchObject({
+		runs: 1,
+		passed: 1,
+		unanswered: 1,
+		unansweredCodes: { llm_spend_limit: 1 },
+	});
+});

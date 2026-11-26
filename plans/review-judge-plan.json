@@ -1,6 +1,6 @@
 {
 	"id": "review-judge-plan",
-	"version": 3,
+	"version": 4,
 	"description": "継続中の目標について、前回までの経過を振り返り、続けるか判断し、続けるなら方法の候補と影響を見積もって一つ選ぶ。前の手が成功し、計画が残り、前提が変わっていなければ考える段を省く（decision は null になり、利用側は計画の次の手へ進む）。",
 	"schemas": {
 		"criterion": {
@@ -336,7 +336,39 @@
 					}
 				]
 			},
-			"maxOutputTokens": 2400
+			"maxOutputTokens": 2400,
+			"ensure": [
+				{
+					"when": {
+						"path": "$.output.decision",
+						"equals": "wait"
+					},
+					"require": {
+						"path": "$.output.wait",
+						"exists": true
+					}
+				},
+				{
+					"when": {
+						"path": "$.output.decision",
+						"equals": "ask"
+					},
+					"require": {
+						"path": "$.output.question",
+						"exists": true
+					}
+				},
+				{
+					"when": {
+						"path": "$.output.keepPlan",
+						"equals": true
+					},
+					"require": {
+						"path": "$.inputs.history.planRemaining",
+						"equals": true
+					}
+				}
+			]
 		},
 		{
 			"id": "plan",
@@ -370,7 +402,17 @@
 					}
 				]
 			},
-			"maxOutputTokens": 3200
+			"maxOutputTokens": 3200,
+			"ensure": [
+				{
+					"index": "$.output.chosen",
+					"within": "$.output.candidates"
+				},
+				{
+					"each": "$.output.candidates[*].steps[*].capabilityRef",
+					"in": "$.inputs.capabilities[*].ref"
+				}
+			]
 		}
 	],
 	"outputs": {

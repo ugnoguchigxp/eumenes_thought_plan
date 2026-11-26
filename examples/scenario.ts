@@ -13,6 +13,8 @@ export type Check = {
  */
 export type Scenario = {
 	readonly id: string;
+	/** `tuning`: plans may be changed from its failures. `heldout`: measured only, never tuned against. */
+	readonly set: "tuning" | "heldout";
 	readonly description: string;
 	/** A bundled plan id, or a file in `examples/plans/`. */
 	readonly plan: { readonly bundled: string } | { readonly file: string };

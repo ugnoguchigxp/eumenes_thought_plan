@@ -1,17 +1,25 @@
-import { holds } from "./conditions";
+import { holds, keeps } from "./conditions";
 import { RunError } from "./errors";
 import {
 	beginRunInTransaction,
 	createLedger,
 	finishRunInTransaction,
 	recordPlanInTransaction,
+	recordReuseInTransaction,
 	recordStageInTransaction,
 	type Ledger,
+	type RunStatus,
 	type StageRow,
 	type StageStatus,
 } from "./ledger";
 import type { InputContext, LlmPort, LlmResult } from "./llm";
-import { loadPlan, sha256, type LoadedPlan, type LoadedStage } from "./plan";
+import {
+	canonicalJson,
+	loadPlan,
+	sha256,
+	type LoadedPlan,
+	type LoadedStage,
+} from "./plan";
 import { readRef, type Scope } from "./refs";
 import { inlineRefs, type JsonSchema } from "./schema";
 
@@ -23,33 +31,68 @@ export type StageResult = {
 	readonly output: unknown;
 };
 
+/**
+ * Why a run stopped. `retryable` is true only when the model port said so (the model never answered: a
+ * connection or rate limit); an answer that could not be used is not retryable with the same input.
+ */
+export type RunFailure = {
+	readonly stageId: string;
+	readonly code: string;
+	readonly retryable: boolean;
+};
+
 export type RunResult = {
 	readonly runId: string;
 	readonly status: "completed" | "failed" | "cancelled";
 	readonly errorCode: string | null;
+	readonly failure: RunFailure | null;
 	readonly outputs: Record<string, unknown> | null;
 	readonly stages: readonly StageResult[];
+	/** The run whose conclusion was reused without a model call (`reuse: "same_inputs"`). */
+	readonly reusedRunId: string | null;
 };
 
 export type RunOptions = {
 	readonly llm: LlmPort;
 	readonly ledger?: Ledger;
-	/** The caller's reference for what the run is about; runs are listed and purged by it. */
+	/** The caller's reference for what the run is about; runs are listed, reused and purged by it. */
 	readonly subjectRef?: string | null;
 	readonly signal?: AbortSignal;
 	/** Passed to every model call unchanged (the Eumenes host's record of what the inputs were drawn from). */
 	readonly llmInput?: InputContext;
+	/** Recorded with the run, never passed to the model (e.g. what started it). */
+	readonly context?: Record<string, unknown>;
+	/**
+	 * `same_inputs`: when the subject's latest run of this plan body completed with the same inputs, return its
+	 * conclusion without a model call. Needs a `subjectRef` and the ledger on.
+	 */
+	readonly reuse?: "same_inputs";
 	readonly now?: () => number;
 	readonly newId?: () => string;
+};
+
+/** What a failing model port may attach to its error, so a failed stage keeps what the call produced. */
+type PortFailure = {
+	readonly code?: unknown;
+	readonly retryable?: unknown;
+	readonly model?: unknown;
+	readonly raw?: unknown;
+	readonly usage?: {
+		readonly inputTokens?: unknown;
+		readonly outputTokens?: unknown;
+		readonly cacheReadTokens?: unknown;
+	};
 };
 
 const errorCode = /^[a-z][a-z0-9_]*$/;
 /** Only fixed identifiers reach the ledger and callers: a `RunError` code or an error's own `code`. */
 function codeOf(error: unknown, fallback: string): string {
 	if (error instanceof RunError) return error.code;
-	const code = (error as { code?: unknown } | null)?.code;
+	const code = (error as PortFailure | null)?.code;
 	return typeof code === "string" && errorCode.test(code) ? code : fallback;
 }
+const count = (value: unknown) =>
+	typeof value === "number" && Number.isFinite(value) ? value : null;
 
 /** Checks the plan's inputs; throws `RunError("inputs_invalid")` naming each faulty path and why. */
 function checkInputs(plan: LoadedPlan, inputs: unknown) {
@@ -71,10 +114,26 @@ function skipReason(stage: LoadedStage, scope: Scope): string | null {
 	return null;
 }
 
+/** The `ensure` rules an output breaks, by their place in the stage (`ensure[0]`, …). */
+function broken(stage: LoadedStage, scope: Scope, output: unknown): string[] {
+	const withOutput: Scope = { ...scope, output };
+	return stage.ensure.flatMap((rule, i) =>
+		keeps(rule, withOutput) ? [] : [`ensure[${i}]`],
+	);
+}
+
 const stageInput = (stage: LoadedStage, scope: Scope) =>
 	Object.fromEntries(
 		stage.input.map(({ key, ref }) => [key, readRef(ref, scope)]),
 	);
+
+/** An input over the stage's bound is not sent and not recorded: only its size is. */
+function oversized(stage: LoadedStage, input: Record<string, unknown>) {
+	const characters = JSON.stringify(input).length;
+	return characters > stage.maxInputCharacters
+		? { omitted: "stage_input_too_large", characters }
+		: null;
+}
 
 const planOutputs = (plan: LoadedPlan, scope: Scope) =>
 	Object.fromEntries(
@@ -91,6 +150,7 @@ const emptyStage = {
 	outputTokens: null,
 	cacheReadTokens: null,
 	latencyMs: null,
+	retryable: null,
 } satisfies Partial<StageRow>;
 
 /** The model's answer, or a rejection as soon as the signal aborts (a port that ignores the signal included). */
@@ -116,9 +176,75 @@ function abortable<T>(
 	});
 }
 
+const usageOf = (receipt: LlmResult<unknown>) => ({
+	model: receipt.model,
+	inputTokens: receipt.inputTokens,
+	outputTokens: receipt.outputTokens,
+	cacheReadTokens: receipt.cacheReadTokens,
+	latencyMs: receipt.latencyMs,
+});
+
+/** Reuses the subject's latest conclusion when it completed with the same inputs; null otherwise. */
+async function reused(
+	plan: LoadedPlan,
+	inputs: Record<string, unknown>,
+	inputsDigest: string,
+	options: RunOptions,
+	ledger: Ledger,
+	runId: string,
+	at: number,
+): Promise<RunResult | null> {
+	if (options.reuse !== "same_inputs" || !options.subjectRef) return null;
+	const latest = ledger.latestRun(options.subjectRef, plan.digest);
+	if (
+		!latest ||
+		latest.status !== "completed" ||
+		latest.inputsDigest !== inputsDigest
+	)
+		return null;
+	const original = latest.reusedRunId ?? latest.runId;
+	await ledger.write((db) => {
+		recordPlanInTransaction(db, plan, at);
+		recordReuseInTransaction(db, {
+			runId,
+			planId: plan.id,
+			planVersion: plan.version,
+			planDigest: plan.digest,
+			subjectRef: options.subjectRef ?? null,
+			mode: "library",
+			inputs,
+			outputs: latest.outputs,
+			startedAtMs: at,
+			inputsDigest,
+			reusedRunId: original,
+			context: options.context ?? null,
+		});
+	});
+	const stages =
+		ledger
+			.readRun(original)
+			?.stages.filter(({ status }) => status !== "rejected")
+			.map((row): StageResult => ({
+				id: row.stageId,
+				status: row.status as StageResult["status"],
+				reason: row.skipReason ?? row.errorCode,
+				output: row.output,
+			})) ?? [];
+	return {
+		runId,
+		status: "completed",
+		errorCode: null,
+		failure: null,
+		outputs: latest.outputs,
+		stages,
+		reusedRunId: original,
+	};
+}
+
 /**
- * Runs every stage in order with the model; stops at the first failed stage. The plan never loops. A stage is
- * recorded once, after it settles; a failing ledger write ends the call with `RunError("ledger_write_failed")`.
+ * Runs every stage in order with the model; stops at the first failed stage. The plan never loops and the
+ * runner never calls again on its own. A stage is recorded once, after it settles. If the ledger fails midway,
+ * the run is closed as failed `ledger_write_failed` (one attempt) and the error is thrown.
  */
 export async function runPlan(
 	plan: LoadedPlan,
@@ -128,8 +254,19 @@ export async function runPlan(
 	const now = options.now ?? Date.now;
 	const ledger = options.ledger ?? createLedger(null, "off");
 	const checked = checkInputs(plan, inputs);
+	const inputsDigest = sha256(canonicalJson(checked));
 	const runId = (options.newId ?? (() => crypto.randomUUID()))();
 	const startedAtMs = now();
+	const reuse = await reused(
+		plan,
+		checked,
+		inputsDigest,
+		options,
+		ledger,
+		runId,
+		startedAtMs,
+	);
+	if (reuse) return reuse;
 	await ledger.write((db) => {
 		recordPlanInTransaction(db, plan, startedAtMs);
 		beginRunInTransaction(db, {
@@ -141,34 +278,96 @@ export async function runPlan(
 			mode: "library",
 			inputs: checked,
 			startedAtMs,
+			inputsDigest,
+			context: options.context ?? null,
 		});
 	});
+	try {
+		return await runStages(plan, checked, options, ledger, runId, now);
+	} catch (error) {
+		await ledger
+			.write((db) =>
+				finishRunInTransaction(db, runId, {
+					status: "failed",
+					outputs: null,
+					errorCode: "ledger_write_failed",
+					finishedAtMs: now(),
+				}),
+			)
+			.catch(() => undefined);
+		throw error;
+	}
+}
+
+async function runStages(
+	plan: LoadedPlan,
+	inputs: Record<string, unknown>,
+	options: RunOptions,
+	ledger: Ledger,
+	runId: string,
+	now: () => number,
+): Promise<RunResult> {
 	const stages = new Map<string, { output: unknown }>();
-	const scope: Scope = { inputs: checked, stages };
+	const scope: Scope = { inputs, stages };
 	const results: StageResult[] = [];
 	const finish = async (
 		status: RunResult["status"],
-		code: string | null,
+		failure: RunFailure | null,
 	): Promise<RunResult> => {
 		const outputs = status === "completed" ? planOutputs(plan, scope) : null;
 		await ledger.write((db) =>
 			finishRunInTransaction(db, runId, {
 				status,
 				outputs,
-				errorCode: code,
+				errorCode: failure?.code ?? null,
 				finishedAtMs: now(),
 			}),
 		);
-		return { runId, status, errorCode: code, outputs, stages: [...results] };
+		return {
+			runId,
+			status,
+			errorCode: failure?.code ?? null,
+			failure,
+			outputs,
+			stages: [...results],
+			reusedRunId: null,
+		};
+	};
+	const fail = async (
+		stage: LoadedStage,
+		row: Partial<StageRow> & { input: unknown },
+		failure: RunFailure,
+		base: StageRow,
+		cancelled = false,
+	) => {
+		await ledger.write((db) =>
+			recordStageInTransaction(db, {
+				...base,
+				...row,
+				status: "failed",
+				errorCode: failure.code,
+				retryable: failure.retryable,
+				finishedAtMs: now(),
+			}),
+		);
+		results.push({
+			id: stage.id,
+			status: "failed",
+			reason: failure.code,
+			output: null,
+		});
+		return finish(cancelled ? "cancelled" : "failed", failure);
 	};
 	for (const [seq, stage] of plan.stages.entries()) {
-		const base = {
+		const base: StageRow = {
 			...emptyStage,
 			runId,
 			seq,
 			stageId: stage.id,
+			status: "ran",
 			systemDigest: sha256(stage.system),
 			startedAtMs: now(),
+			finishedAtMs: 0,
 		};
 		const reason = skipReason(stage, scope);
 		if (reason) {
@@ -184,11 +383,17 @@ export async function runPlan(
 			continue;
 		}
 		const input = stageInput(stage, scope);
-		let settled:
-			| { ok: true; receipt: LlmResult<unknown>; output: unknown }
-			| { ok: false; code: string; cancelled: boolean };
+		const tooLarge = oversized(stage, input);
+		if (tooLarge)
+			return fail(
+				stage,
+				{ input: tooLarge },
+				{ stageId: stage.id, code: "stage_input_too_large", retryable: false },
+				base,
+			);
+		let receipt: LlmResult<unknown>;
 		try {
-			const receipt = await abortable(
+			receipt = await abortable(
 				(signal) =>
 					options.llm.complete(
 						{
@@ -203,49 +408,51 @@ export async function runPlan(
 					),
 				options.signal,
 			);
-			const output = stage.outputSchema.safeParse(receipt.value);
-			settled = output.success
-				? { ok: true, receipt, output: output.data }
-				: { ok: false, code: "stage_output_invalid", cancelled: false };
 		} catch (error) {
 			const cancelled = options.signal?.aborted === true;
-			settled = {
-				ok: false,
-				code: cancelled ? "run_cancelled" : codeOf(error, "stage_llm_failed"),
-				cancelled,
-			};
-		}
-		if (!settled.ok) {
-			const { code, cancelled } = settled;
-			await ledger.write((db) =>
-				recordStageInTransaction(db, {
-					...base,
-					status: "failed",
+			const port = (error ?? {}) as PortFailure;
+			return fail(
+				stage,
+				{
 					input,
-					errorCode: code,
-					finishedAtMs: now(),
-				}),
+					output: cancelled ? null : (port.raw ?? null),
+					model: typeof port.model === "string" ? port.model : null,
+					inputTokens: count(port.usage?.inputTokens),
+					outputTokens: count(port.usage?.outputTokens),
+					cacheReadTokens: count(port.usage?.cacheReadTokens),
+				},
+				{
+					stageId: stage.id,
+					code: cancelled ? "run_cancelled" : codeOf(error, "stage_llm_failed"),
+					retryable: !cancelled && port.retryable === true,
+				},
+				base,
+				cancelled,
 			);
-			results.push({
-				id: stage.id,
-				status: "failed",
-				reason: code,
-				output: null,
-			});
-			return finish(cancelled ? "cancelled" : "failed", code);
 		}
-		const { receipt, output } = settled;
+		const parsed = stage.outputSchema.safeParse(receipt.value);
+		const breaks = parsed.success ? broken(stage, scope, parsed.data) : [];
+		if (!parsed.success || breaks.length)
+			return fail(
+				stage,
+				{ input, output: receipt.value, ...usageOf(receipt) },
+				{
+					stageId: stage.id,
+					code: parsed.success
+						? "stage_output_inconsistent"
+						: "stage_output_invalid",
+					retryable: false,
+				},
+				base,
+			);
+		const output = parsed.data;
 		await ledger.write((db) =>
 			recordStageInTransaction(db, {
 				...base,
 				status: "ran",
 				input,
 				output,
-				model: receipt.model,
-				inputTokens: receipt.inputTokens,
-				outputTokens: receipt.outputTokens,
-				cacheReadTokens: receipt.cacheReadTokens,
-				latencyMs: receipt.latencyMs,
+				...usageOf(receipt),
 				finishedAtMs: now(),
 			}),
 		);
@@ -271,7 +478,8 @@ export type StepView =
 	  }
 	| {
 			readonly runId: string;
-			readonly status: "completed" | "cancelled";
+			readonly status: "completed" | "cancelled" | "failed";
+			readonly code: string | null;
 			readonly outputs: Record<string, unknown> | null;
 			readonly stages: readonly StageResult[];
 	  };
@@ -283,25 +491,37 @@ export type Rejection = {
 	readonly issues: readonly string[];
 };
 
+type Done = Exclude<RunStatus, "running">;
 type Live = {
-	readonly plan: LoadedPlan;
+	/** Null only for a finished run read back from the ledger: it is shown from its record, not re-loaded. */
+	readonly plan: LoadedPlan | null;
 	readonly inputs: Record<string, unknown>;
 	readonly subjectRef: string | null;
 	readonly stages: Map<string, { output: unknown }>;
 	readonly results: StageResult[];
+	/** Submissions refused per stage, bounded by `REJECTIONS_PER_STAGE`. */
+	readonly rejected: Map<string, number>;
 	next: number;
 	seq: number;
-	done: "completed" | "cancelled" | null;
+	done: {
+		status: Done;
+		code: string | null;
+		outputs?: Record<string, unknown> | null;
+	} | null;
 };
 
 /** Finished runs kept in memory when there is no ledger to read them back from. */
 const OFF_LEDGER_FINISHED = 256;
+/** Refused submissions a stage accepts before the run is closed as failed. */
+export const REJECTIONS_PER_STAGE = 16;
+/** A refused submission larger than this keeps only its size in the ledger. */
+const REJECTED_OUTPUT_CHARACTERS = 16_000;
 
 /**
  * Runs a plan whose stages are thought out by the caller (a coding agent through MCP): the runner skips what
- * its conditions skip, checks each submitted output against the stage's schema and wires it on. Every change
- * is written to the ledger before the run moves on in memory. With the ledger on, a run continues from the
- * ledger after a restart; with it off, runs live in this process only.
+ * its conditions skip, checks each submitted output against the stage's schema and `ensure` rules and wires it
+ * on. Every change is written to the ledger before the run moves on in memory. With the ledger on, a run
+ * continues from the ledger after a restart; with it off, runs live in this process only.
  */
 export function createStepRunner(options: {
 	readonly ledger?: Ledger;
@@ -319,35 +539,50 @@ export function createStepRunner(options: {
 	});
 
 	/** Only a stepwise run is continued here: a library run belongs to the process that runs it. */
+	/**
+	 * Only a stepwise run is continued here: a library run belongs to the process that runs it. A finished run
+	 * (or one whose stage failed) is shown from its record without loading its plan again, so a plan the current
+	 * load checks would refuse can still be read back.
+	 */
 	function restore(runId: string): Live | null {
 		const saved = ledger.readRun(runId);
 		if (!saved || saved.run.mode !== "stepwise") return null;
 		const stages = new Map<string, { output: unknown }>();
 		const results: StageResult[] = [];
+		const rejected = new Map<string, number>();
 		for (const row of saved.stages) {
-			if (row.status === "rejected") continue;
+			if (row.status === "rejected") {
+				rejected.set(row.stageId, (rejected.get(row.stageId) ?? 0) + 1);
+				continue;
+			}
 			if (row.status === "ran") stages.set(row.stageId, { output: row.output });
 			results.push({
 				id: row.stageId,
 				status: row.status,
 				reason: row.skipReason ?? row.errorCode,
-				output: row.output,
+				output: row.status === "ran" ? row.output : null,
 			});
 		}
+		const failedStage = saved.stages.find(({ status }) => status === "failed");
+		const finished = saved.run.status !== "running" || failedStage;
 		const state: Live = {
-			plan: loadPlan(saved.plan.document),
+			plan: finished ? null : loadPlan(saved.plan.document),
 			inputs: saved.run.inputs,
 			subjectRef: saved.run.subjectRef,
 			stages,
 			results,
+			rejected,
 			next: results.length,
 			seq: Math.max(-1, ...saved.stages.map(({ seq }) => seq)) + 1,
-			done:
-				saved.run.status === "running"
-					? null
-					: saved.run.status === "completed"
-						? "completed"
-						: "cancelled",
+			done: !finished
+				? null
+				: saved.run.status === "running"
+					? { status: "failed", code: failedStage!.errorCode, outputs: null }
+					: {
+							status: saved.run.status,
+							code: saved.run.errorCode,
+							outputs: saved.run.outputs,
+						},
 		};
 		live.set(runId, state);
 		return state;
@@ -367,36 +602,86 @@ export function createStepRunner(options: {
 			live.delete(id);
 	}
 
+	async function close(
+		runId: string,
+		state: Live,
+		status: Done,
+		code: string | null,
+		outputs: Record<string, unknown> | null,
+	) {
+		await ledger.write((db) =>
+			finishRunInTransaction(db, runId, {
+				status,
+				outputs,
+				errorCode: code,
+				finishedAtMs: now(),
+			}),
+		);
+		state.done = { status, code, outputs };
+	}
+
 	async function advance(runId: string, state: Live): Promise<StepView> {
 		const scope: Scope = { inputs: state.inputs, stages: state.stages };
-		while (!state.done && state.next < state.plan.stages.length) {
-			const stage = state.plan.stages[state.next]!;
+		const plan = state.plan;
+		while (plan && !state.done && state.next < plan.stages.length) {
+			const stage = plan.stages[state.next]!;
 			const reason = skipReason(stage, scope);
-			if (!reason)
-				return {
-					runId,
-					status: "awaiting",
-					stage: {
-						id: stage.id,
-						description: stage.description,
-						system: stage.system,
-						input: stageInput(stage, scope),
-						outputSchema: inlineRefs(stage.output, state.plan.schemas),
-					},
-					stages: [...state.results],
-				};
 			const at = now();
+			const base = {
+				...emptyStage,
+				runId,
+				seq: state.seq,
+				stageId: stage.id,
+				systemDigest: sha256(stage.system),
+				startedAtMs: at,
+				finishedAtMs: at,
+			};
+			if (!reason) {
+				const input = stageInput(stage, scope);
+				const tooLarge = oversized(stage, input);
+				if (!tooLarge)
+					return {
+						runId,
+						status: "awaiting",
+						stage: {
+							id: stage.id,
+							description: stage.description,
+							system: stage.system,
+							input,
+							outputSchema: inlineRefs(stage.output, plan.schemas),
+						},
+						stages: [...state.results],
+					};
+				await ledger.write((db) =>
+					recordStageInTransaction(db, {
+						...base,
+						status: "failed",
+						input: tooLarge,
+						errorCode: "stage_input_too_large",
+						retryable: false,
+					}),
+				);
+				// The run is over in memory before its end is written: a failing write never lets it move on.
+				state.seq++;
+				state.results.push({
+					id: stage.id,
+					status: "failed",
+					reason: "stage_input_too_large",
+					output: null,
+				});
+				state.done = {
+					status: "failed",
+					code: "stage_input_too_large",
+					outputs: null,
+				};
+				await close(runId, state, "failed", "stage_input_too_large", null);
+				break;
+			}
 			await ledger.write((db) =>
 				recordStageInTransaction(db, {
-					...emptyStage,
-					runId,
-					seq: state.seq,
-					stageId: stage.id,
+					...base,
 					status: "skipped",
 					skipReason: reason,
-					systemDigest: sha256(stage.system),
-					startedAtMs: at,
-					finishedAtMs: at,
 				}),
 			);
 			state.seq++;
@@ -408,23 +693,19 @@ export function createStepRunner(options: {
 				output: null,
 			});
 		}
-		if (!state.done) {
-			const outputs = planOutputs(state.plan, scope);
-			await ledger.write((db) =>
-				finishRunInTransaction(db, runId, {
-					status: "completed",
-					outputs,
-					errorCode: null,
-					finishedAtMs: now(),
-				}),
-			);
-			state.done = "completed";
-		}
+		if (plan && !state.done)
+			await close(runId, state, "completed", null, planOutputs(plan, scope));
+		const done = state.done!;
 		const view: StepView = {
 			runId,
-			status: state.done,
+			status: done.status,
+			code: done.code,
 			outputs:
-				state.done === "completed" ? planOutputs(state.plan, scope) : null,
+				done.status !== "completed"
+					? null
+					: plan
+						? planOutputs(plan, scope)
+						: (done.outputs ?? null),
 			stages: [...state.results],
 		};
 		settleMemory(runId, state);
@@ -432,12 +713,27 @@ export function createStepRunner(options: {
 	}
 
 	const find = (runId: string) => live.get(runId) ?? restore(runId);
+	/** Operations on one run take turns, so two submissions to the same stage cannot both move it on. */
+	const turns = new Map<string, Promise<unknown>>();
+	function inTurn<T>(runId: string, operation: () => Promise<T>): Promise<T> {
+		const previous = turns.get(runId) ?? Promise.resolve();
+		const next = previous.catch(() => undefined).then(operation);
+		const settled = next.catch(() => undefined);
+		turns.set(runId, settled);
+		void settled.then(() => {
+			if (turns.get(runId) === settled) turns.delete(runId);
+		});
+		return next;
+	}
 
 	return {
 		async start(
 			plan: LoadedPlan,
 			inputs: unknown,
-			start: { subjectRef?: string | null } = {},
+			start: {
+				subjectRef?: string | null;
+				context?: Record<string, unknown>;
+			} = {},
 		): Promise<StepView> {
 			const checked = checkInputs(plan, inputs);
 			const runId = (options.newId ?? (() => crypto.randomUUID()))();
@@ -453,6 +749,8 @@ export function createStepRunner(options: {
 					mode: "stepwise",
 					inputs: checked,
 					startedAtMs: at,
+					inputsDigest: sha256(canonicalJson(checked)),
+					context: start.context ?? null,
 				});
 			});
 			const state: Live = {
@@ -461,6 +759,7 @@ export function createStepRunner(options: {
 				subjectRef: start.subjectRef ?? null,
 				stages: new Map(),
 				results: [],
+				rejected: new Map(),
 				next: 0,
 				seq: 0,
 				done: null,
@@ -469,14 +768,44 @@ export function createStepRunner(options: {
 			return advance(runId, state);
 		},
 
-		async submit(
+		submit(
 			runId: string,
 			stageId: string,
 			output: unknown,
 		): Promise<StepView | Rejection> {
+			return inTurn(runId, () => submitInTurn(runId, stageId, output));
+		},
+
+		cancel(runId: string): Promise<StepView | Rejection> {
+			return inTurn(runId, () => cancelInTurn(runId));
+		},
+
+		/** The current view of a run: the stage it waits for, or its result. */
+		view(runId: string): Promise<StepView | Rejection> {
+			return inTurn(runId, async () => {
+				const state = find(runId);
+				return state ? advance(runId, state) : unknown(runId);
+			});
+		},
+
+		/** Forgets a subject: its runs leave the ledger and this process, and later submissions are refused. */
+		async purgeSubject(subjectRef: string): Promise<number> {
+			const removed = await ledger.purgeSubject(subjectRef);
+			for (const [id, run] of live)
+				if (run.subjectRef === subjectRef) live.delete(id);
+			return removed;
+		},
+	};
+
+	async function submitInTurn(
+		runId: string,
+		stageId: string,
+		output: unknown,
+	): Promise<StepView | Rejection> {
+		{
 			const state = find(runId);
 			if (!state) return unknown(runId);
-			const stage = state.plan.stages[state.next];
+			const stage = state.plan?.stages[state.next];
 			if (state.done || !stage || stage.id !== stageId)
 				return {
 					runId,
@@ -487,6 +816,7 @@ export function createStepRunner(options: {
 			const scope: Scope = { inputs: state.inputs, stages: state.stages };
 			const input = stageInput(stage, scope);
 			const checked = stage.outputSchema.safeParse(output);
+			const breaks = checked.success ? broken(stage, scope, checked.data) : [];
 			const at = now();
 			const base = {
 				...emptyStage,
@@ -499,22 +829,50 @@ export function createStepRunner(options: {
 				startedAtMs: at,
 				finishedAtMs: at,
 			};
-			if (!checked.success) {
+			if (!checked.success || breaks.length) {
+				const code = checked.success
+					? "stage_output_inconsistent"
+					: "stage_output_invalid";
+				const refused = state.rejected.get(stageId) ?? 0;
+				if (refused >= REJECTIONS_PER_STAGE) {
+					state.done = {
+						status: "failed",
+						code: "stage_rejections_exceeded",
+						outputs: null,
+					};
+					await close(
+						runId,
+						state,
+						"failed",
+						"stage_rejections_exceeded",
+						null,
+					);
+					return advance(runId, state);
+				}
+				const characters = (JSON.stringify(output) ?? "").length;
 				await ledger.write((db) =>
 					recordStageInTransaction(db, {
 						...base,
+						output:
+							characters > REJECTED_OUTPUT_CHARACTERS
+								? { omitted: "rejected_output_too_large", characters }
+								: output,
 						status: "rejected",
-						errorCode: "stage_output_invalid",
+						errorCode: code,
 					}),
 				);
 				state.seq++;
+				state.rejected.set(stageId, refused + 1);
 				return {
 					runId,
 					status: "rejected",
-					code: "stage_output_invalid",
-					issues: checked.error.issues.map(
-						(issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`,
-					),
+					code,
+					issues: checked.success
+						? breaks
+						: checked.error.issues.map(
+								(issue) =>
+									`${issue.path.join(".") || "(root)"}: ${issue.message}`,
+							),
 				};
 			}
 			await ledger.write((db) =>
@@ -534,37 +892,14 @@ export function createStepRunner(options: {
 				output: checked.data,
 			});
 			return advance(runId, state);
-		},
+		}
+	}
 
-		async cancel(runId: string): Promise<StepView | Rejection> {
-			const state = find(runId);
-			if (!state) return unknown(runId);
-			if (!state.done) {
-				await ledger.write((db) =>
-					finishRunInTransaction(db, runId, {
-						status: "cancelled",
-						outputs: null,
-						errorCode: "run_cancelled",
-						finishedAtMs: now(),
-					}),
-				);
-				state.done = "cancelled";
-			}
-			return advance(runId, state);
-		},
-
-		/** The current view of a run: the stage it waits for, or its result. */
-		async view(runId: string): Promise<StepView | Rejection> {
-			const state = find(runId);
-			return state ? advance(runId, state) : unknown(runId);
-		},
-
-		/** Forgets a subject: its runs leave the ledger and this process, and later submissions are refused. */
-		async purgeSubject(subjectRef: string): Promise<number> {
-			const removed = await ledger.purgeSubject(subjectRef);
-			for (const [id, run] of live)
-				if (run.subjectRef === subjectRef) live.delete(id);
-			return removed;
-		},
-	};
+	async function cancelInTurn(runId: string): Promise<StepView | Rejection> {
+		const state = find(runId);
+		if (!state) return unknown(runId);
+		if (!state.done)
+			await close(runId, state, "cancelled", "run_cancelled", null);
+		return advance(runId, state);
+	}
 }

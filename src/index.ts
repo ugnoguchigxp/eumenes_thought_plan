@@ -1,15 +1,19 @@
 export { PlanError, RunError } from "./errors";
-export type { Condition } from "./conditions";
+export type { Condition, EnsureRule } from "./conditions";
 export {
+	abandonRunsInTransaction,
 	applyMigrations,
 	beginRunInTransaction,
 	createLedger,
 	finishRunInTransaction,
+	latestRunInTransaction,
 	listRunsInTransaction,
 	openLedgerStore,
+	pruneRunsInTransaction,
 	purgeSubjectInTransaction,
 	readRunInTransaction,
 	recordPlanInTransaction,
+	recordReuseInTransaction,
 	recordStageInTransaction,
 	thoughtPlanMigrations,
 	type Ledger,
@@ -28,11 +32,17 @@ export {
 	type LoadedPlan,
 	type LoadedStage,
 } from "./plan";
-export { bundledPlans, loadPlanDirectory, mergePlans } from "./plans";
+export {
+	bundledPlans,
+	loadPlanDirectory,
+	mergePlans,
+	scanPlanDirectory,
+} from "./plans";
 export {
 	createStepRunner,
 	runPlan,
 	type Rejection,
+	type RunFailure,
 	type RunOptions,
 	type RunResult,
 	type StageResult,

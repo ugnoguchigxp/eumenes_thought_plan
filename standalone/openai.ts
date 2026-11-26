@@ -50,14 +50,36 @@ export function readLlmConfig(path = defaultLlmConfigPath): LlmConfig {
 	return llmConfigSchema.parse(JSON.parse(readFileSync(path, "utf8")));
 }
 
-/** A failed model call with a fixed code: what the runner records as the stage's error. */
+/**
+ * A failed model call with a fixed code: what the runner records as the stage's error. `retryable` says the
+ * model never answered (connection, rate limit, server error). When an answer arrived but could not be used,
+ * `usage`, `model` and `raw` carry what it was, so the failed stage keeps it in the ledger.
+ */
 export class LlmCallError extends Error {
 	constructor(
 		readonly code: string,
 		readonly retryable: boolean,
+		readonly details: {
+			readonly model?: string;
+			readonly raw?: unknown;
+			readonly usage?: {
+				readonly inputTokens: number;
+				readonly outputTokens: number;
+				readonly cacheReadTokens: number;
+			};
+		} = {},
 	) {
 		super(code);
 		this.name = "LlmCallError";
+	}
+	get model() {
+		return this.details.model;
+	}
+	get raw() {
+		return this.details.raw;
+	}
+	get usage() {
+		return this.details.usage;
 	}
 }
 
@@ -180,8 +202,16 @@ export function createOpenAILlm(
 					cached: usage.input_tokens_details.cached_tokens,
 					output: usage.output_tokens,
 				});
+				const details = {
+					model: response.model,
+					usage: {
+						inputTokens: usage.input_tokens,
+						outputTokens: usage.output_tokens,
+						cacheReadTokens: usage.input_tokens_details.cached_tokens,
+					},
+				};
 				if (response.model !== config.model)
-					throw new LlmCallError("llm_model_not_confirmed", false);
+					throw new LlmCallError("llm_model_not_confirmed", false, details);
 				if (
 					response.output.some(
 						(item) =>
@@ -189,22 +219,31 @@ export function createOpenAILlm(
 							item.content.some((part) => part.type === "refusal"),
 					)
 				)
-					throw new LlmCallError("llm_refusal", false);
+					throw new LlmCallError("llm_refusal", false, details);
 				if (response.status !== "completed")
 					throw new LlmCallError(
 						response.incomplete_details?.reason === "max_output_tokens"
 							? "llm_max_tokens"
 							: "llm_incomplete",
 						false,
+						{ ...details, raw: textOf(response) },
 					);
+				const text = textOf(response);
 				let raw: unknown;
 				try {
-					raw = JSON.parse(textOf(response));
+					raw = JSON.parse(text);
 				} catch {
-					throw new LlmCallError("llm_output_not_json", false);
+					throw new LlmCallError("llm_output_not_json", false, {
+						...details,
+						raw: text,
+					});
 				}
 				const parsed = request.schema.safeParse(raw);
-				if (!parsed.success) throw new LlmCallError("llm_output_schema", false);
+				if (!parsed.success)
+					throw new LlmCallError("llm_output_schema", false, {
+						...details,
+						raw,
+					});
 				return {
 					value: parsed.data,
 					model: response.model,

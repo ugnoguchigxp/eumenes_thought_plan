@@ -51,6 +51,17 @@ CREATE TABLE thought_plan_stages (
 );
 `,
 	},
+	{
+		id: "thought-plan/0002-reuse-context",
+		after: ["thought-plan/0001-ledger"],
+		sql: `
+ALTER TABLE thought_plan_runs ADD COLUMN inputs_digest TEXT;
+ALTER TABLE thought_plan_runs ADD COLUMN reused_run_id TEXT;
+ALTER TABLE thought_plan_runs ADD COLUMN context_json TEXT;
+ALTER TABLE thought_plan_stages ADD COLUMN retryable INTEGER;
+CREATE INDEX thought_plan_runs_latest ON thought_plan_runs (subject_ref, plan_digest, started_at_ms) WHERE subject_ref IS NOT NULL;
+`,
+	},
 ];
 
 export type LedgerMode = "full" | "off";
@@ -77,6 +88,12 @@ export type RunRow = {
 	readonly errorCode: string | null;
 	readonly startedAtMs: number;
 	readonly finishedAtMs: number | null;
+	/** SHA-256 of the canonical JSON of the inputs (null on runs recorded before it was kept). */
+	readonly inputsDigest: string | null;
+	/** The run whose conclusion this run reused without a model call. */
+	readonly reusedRunId: string | null;
+	/** What the caller attached to the run (never passed to the model). */
+	readonly context: Record<string, unknown> | null;
 };
 export type StageRow = {
 	readonly runId: string;
@@ -93,6 +110,8 @@ export type StageRow = {
 	readonly outputTokens: number | null;
 	readonly cacheReadTokens: number | null;
 	readonly latencyMs: number | null;
+	/** For a failed stage: whether calling again with the same input may succeed (the model never answered). */
+	readonly retryable: boolean | null;
 	readonly startedAtMs: number;
 	readonly finishedAtMs: number;
 };
@@ -131,11 +150,15 @@ export function recordPlanInTransaction(
 
 export function beginRunInTransaction(
 	db: Database,
-	run: Omit<RunRow, "outputs" | "status" | "errorCode" | "finishedAtMs">,
+	run: Omit<
+		RunRow,
+		"outputs" | "status" | "errorCode" | "finishedAtMs" | "reusedRunId"
+	>,
 ): void {
 	db.query(
-		`INSERT INTO thought_plan_runs (run_id, plan_id, plan_version, plan_digest, subject_ref, mode, inputs_json, status, started_at_ms)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+		`INSERT INTO thought_plan_runs (run_id, plan_id, plan_version, plan_digest, subject_ref, mode, inputs_json, status,
+		  started_at_ms, inputs_digest, context_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)`,
 	).run(
 		run.runId,
 		run.planId,
@@ -145,7 +168,96 @@ export function beginRunInTransaction(
 		run.mode,
 		JSON.stringify(run.inputs),
 		run.startedAtMs,
+		run.inputsDigest,
+		json(run.context ?? undefined),
 	);
+}
+
+/** A run that takes another run's conclusion: recorded complete at once, with no stages of its own. */
+export function recordReuseInTransaction(
+	db: Database,
+	run: Omit<RunRow, "status" | "errorCode" | "finishedAtMs"> & {
+		reusedRunId: string;
+	},
+): void {
+	db.query(
+		`INSERT INTO thought_plan_runs (run_id, plan_id, plan_version, plan_digest, subject_ref, mode, inputs_json, outputs_json,
+		  status, started_at_ms, finished_at_ms, inputs_digest, reused_run_id, context_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?)`,
+	).run(
+		run.runId,
+		run.planId,
+		run.planVersion,
+		run.planDigest,
+		run.subjectRef,
+		run.mode,
+		JSON.stringify(run.inputs),
+		json(run.outputs),
+		run.startedAtMs,
+		run.startedAtMs,
+		run.inputsDigest,
+		run.reusedRunId,
+		json(run.context ?? undefined),
+	);
+}
+
+/** The most recent model-driven (`library`) run of a plan body for a subject, whatever its status. */
+export function latestRunInTransaction(
+	db: Database,
+	subjectRef: string,
+	planDigest: string,
+): RunRow | null {
+	const row = db
+		.query<RunDbRow, [string, string]>(
+			`SELECT * FROM thought_plan_runs WHERE subject_ref = ? AND plan_digest = ? AND mode = 'library'
+			 ORDER BY started_at_ms DESC, rowid DESC LIMIT 1`,
+		)
+		.get(subjectRef, planDigest);
+	return row ? runRow(row) : null;
+}
+
+/**
+ * Closes runs left `running` (a crashed process, an agent that stopped midway) as failed `run_abandoned`:
+ * those with no activity (their start or their latest stage) since `idleSinceMs`.
+ */
+export function abandonRunsInTransaction(
+	db: Database,
+	filter: { idleSinceMs: number; mode?: RunMode; nowMs: number },
+): number {
+	return db
+		.query(
+			`UPDATE thought_plan_runs SET status = 'failed', error_code = 'run_abandoned', finished_at_ms = ?1
+			 WHERE status = 'running' AND (?3 IS NULL OR mode = ?3)
+			   AND COALESCE(
+			     (SELECT MAX(s.finished_at_ms) FROM thought_plan_stages s WHERE s.run_id = thought_plan_runs.run_id),
+			     started_at_ms) < ?2`,
+		)
+		.run(filter.nowMs, filter.idleSinceMs, filter.mode ?? null).changes;
+}
+
+/**
+ * Deletes finished runs older than the bound with their stages, and the plan bodies no run uses any more.
+ * Never called on its own: the host decides when and how far back.
+ */
+export function pruneRunsInTransaction(
+	db: Database,
+	filter: { finishedBeforeMs: number },
+): { runs: number; plans: number } {
+	const old =
+		"SELECT run_id FROM thought_plan_runs WHERE status <> 'running' AND finished_at_ms < ?";
+	db.query(`DELETE FROM thought_plan_stages WHERE run_id IN (${old})`).run(
+		filter.finishedBeforeMs,
+	);
+	const runs = db
+		.query(`DELETE FROM thought_plan_runs WHERE run_id IN (${old})`)
+		.run(filter.finishedBeforeMs).changes;
+	const plans = db
+		.query(
+			`DELETE FROM thought_plan_plans WHERE NOT EXISTS (
+			   SELECT 1 FROM thought_plan_runs r WHERE r.plan_id = thought_plan_plans.plan_id AND r.plan_version = thought_plan_plans.version)`,
+		)
+		.run().changes;
+	return { runs, plans };
 }
 
 /** A stage is recorded only into a run that is still running (not finished, not purged). */
@@ -159,8 +271,8 @@ export function recordStageInTransaction(db: Database, stage: StageRow): void {
 		throw new RunError(run ? "run_not_running" : "run_unknown");
 	db.query(
 		`INSERT INTO thought_plan_stages (run_id, seq, stage_id, status, skip_reason, input_json, system_digest, output_json,
-		  error_code, model, input_tokens, output_tokens, cache_read_tokens, latency_ms, started_at_ms, finished_at_ms)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  error_code, model, input_tokens, output_tokens, cache_read_tokens, latency_ms, started_at_ms, finished_at_ms, retryable)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	).run(
 		stage.runId,
 		stage.seq,
@@ -178,6 +290,7 @@ export function recordStageInTransaction(db: Database, stage: StageRow): void {
 		stage.latencyMs,
 		stage.startedAtMs,
 		stage.finishedAtMs,
+		stage.retryable === null ? null : stage.retryable ? 1 : 0,
 	);
 }
 
@@ -222,6 +335,9 @@ type RunDbRow = {
 	error_code: string | null;
 	started_at_ms: number;
 	finished_at_ms: number | null;
+	inputs_digest: string | null;
+	reused_run_id: string | null;
+	context_json: string | null;
 };
 const runRow = (row: RunDbRow): RunRow => ({
 	runId: row.run_id,
@@ -236,6 +352,9 @@ const runRow = (row: RunDbRow): RunRow => ({
 	errorCode: row.error_code,
 	startedAtMs: row.started_at_ms,
 	finishedAtMs: row.finished_at_ms,
+	inputsDigest: row.inputs_digest,
+	reusedRunId: row.reused_run_id,
+	context: parsed(row.context_json) as Record<string, unknown> | null,
 });
 
 export function readRunInTransaction(
@@ -279,6 +398,10 @@ export function readRunInTransaction(
 			outputTokens: stage.output_tokens as number | null,
 			cacheReadTokens: stage.cache_read_tokens as number | null,
 			latencyMs: stage.latency_ms as number | null,
+			retryable:
+				stage.retryable === null || stage.retryable === undefined
+					? null
+					: stage.retryable === 1,
 			startedAtMs: stage.started_at_ms as number,
 			finishedAtMs: stage.finished_at_ms as number,
 		}));
@@ -317,6 +440,7 @@ export interface Ledger {
 	readRun(runId: string): ReturnType<typeof readRunInTransaction>;
 	listRuns(filter: Parameters<typeof listRunsInTransaction>[1]): RunRow[];
 	purgeSubject(subjectRef: string): Promise<number>;
+	latestRun(subjectRef: string, planDigest: string): RunRow | null;
 }
 
 export function createLedger(
@@ -342,6 +466,12 @@ export function createLedger(
 			active ? active.read((db) => readRunInTransaction(db, runId)) : null,
 		listRuns: (filter) =>
 			active ? active.read((db) => listRunsInTransaction(db, filter)) : [],
+		latestRun: (subjectRef, planDigest) =>
+			active
+				? active.read((db) =>
+						latestRunInTransaction(db, subjectRef, planDigest),
+					)
+				: null,
 		purgeSubject: async (subjectRef) =>
 			active
 				? active.write((db) => purgeSubjectInTransaction(db, subjectRef))

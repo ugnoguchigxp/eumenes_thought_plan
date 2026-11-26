@@ -91,6 +91,7 @@ type Candidate = {
 export const live2dScenarios: Scenario[] = [
 	{
 		id: "live2d-goal-stalled",
+		set: "tuning",
 		description:
 			"今回の停止: 同じ方法の失敗が8回続いた直後。振り返りで繰り返しを認め、未試行の登録検査を、変更なしの方法として選べるか。",
 		plan: { bundled: "review-judge-plan" },
@@ -197,6 +198,7 @@ export const live2dScenarios: Scenario[] = [
 	},
 	{
 		id: "live2d-goal-reflection",
+		set: "tuning",
 		description:
 			"今回の停止: 監督の判断入力上限による失敗の直後の振り返り。同じ失敗の繰り返しだと認め、同じ依頼をそのまま再送せず、次に変える条件を出せるか。",
 		plan: { bundled: "post-failure-reflection" },
@@ -211,6 +213,19 @@ export const live2dScenarios: Scenario[] = [
 			earlier: attempts
 				.slice(0, 7)
 				.map(({ approach, observed }) => ({ approach, observed })),
+			// The supervisor's decision input is assembled by the host: its length is not among these.
+			controls: [
+				{
+					id: "capability",
+					description:
+						"使う能力を、提示されている別の能力（登録検査、Web調査）に替える。",
+				},
+				{
+					id: "request-wording",
+					description:
+						"開発監督への依頼文の言い回し（確認してほしい観点の順序や書き方）を変える。",
+				},
+			],
 		},
 		ran: ["observe", "hypothesize", "change"],
 		skipped: [],
@@ -231,7 +246,7 @@ export const live2dScenarios: Scenario[] = [
 				],
 			},
 			change: {
-				change: "監督を通さない手段に変える",
+				change: { controlId: "capability", to: "登録検査" },
 				avoid: ["同じ依頼の再送"],
 				sameApproachAllowed: false,
 				nextStep: "登録検査を使う",
@@ -244,11 +259,25 @@ export const live2dScenarios: Scenario[] = [
 				outputAt(result, "observation"),
 			),
 			check(
-				"同じ方法を使うなら変える条件を示し、同じ依頼の再送を避ける",
-				(outputAt(result, "next.sameApproachAllowed") === false ||
-					String(outputAt(result, "next.change") ?? "").length > 0) &&
-					((outputAt(result, "next.avoid") ?? []) as string[]).length > 0,
+				"同じ方法を使うなら、変える条件が変えられるものの中にある",
+				outputAt(result, "next.sameApproachAllowed") === false ||
+					["capability", "request-wording"].includes(
+						outputAt(result, "next.change.controlId") as string,
+					),
 				outputAt(result, "next"),
+			),
+			check(
+				"入力上限の失敗を、依頼文の言い回しで直せるとしない",
+				!(
+					outputAt(result, "next.sameApproachAllowed") === true &&
+					outputAt(result, "next.change.controlId") === "request-wording"
+				),
+				outputAt(result, "next"),
+			),
+			check(
+				"同じ依頼の再送を避ける手がある",
+				((outputAt(result, "next.avoid") ?? []) as string[]).length > 0,
+				outputAt(result, "next.avoid"),
 			),
 			check(
 				"原因の仮説が観測に根拠を持つ",
@@ -261,6 +290,7 @@ export const live2dScenarios: Scenario[] = [
 	},
 	{
 		id: "live2d-goal-on-plan",
+		set: "tuning",
 		description:
 			"計画どおり: 前の手（登録検査の準備）が成功し、計画が残り、前提も変わっていない。考える段を省き、推論0回で次の手へ進めるか。",
 		plan: { bundled: "review-judge-plan" },

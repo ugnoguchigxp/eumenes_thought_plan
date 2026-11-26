@@ -1,6 +1,6 @@
 # eumenes_thought_plan 設計書
 
-2026年11月26日。利用者の合意（2026-11-26「このまま実装に移れますか？」）。§9の段1〜6を実装・固定試験済み（49件）。ChatGPT API の接続と examples を追加し、gpt-6-luna・推論強度 low の実モデルで10シナリオを確認（§10）。段7（Eumenes への取込み）は未実装。
+2026年11月26日。利用者の合意（2026-11-26「このまま実装に移れますか？」）。版 0.2.0。§9の段1〜6を実装・固定試験済み。評価と改善（[改善案](.archived/thought-plan-improvements-2026-11-26.md)。利用者「改善点があれば全部やりましょうか」）を §3〜§6・§10 に反映した。実セッションでの MCP 受入と段7（Eumenes への取込み）は未実施。状態の内訳は §9。
 
 利用者の方針（2026-11-26）:
 - Agency と同列の独立プロジェクトにする。
@@ -90,6 +90,8 @@ Eumenes と `eumenes_agency` に揃える。
 | `stages[].input` | 段に渡す値の配線。参照は `$.inputs.<name>…` か、その段より前の `$.stages.<id>.output…` だけ |
 | `stages[].output` | 段の出力の JSON Schema。LLM の構造化出力のスキーマとして渡し、受け取った値もこれで検査する |
 | `runWhen`・`skipWhen` | 推論せずに評価する条件。満たさなければ段を省き、推論を呼ばない |
+| `stages[].ensure` | 出力がスキーマのほかに守る規則（最大32件）。推論せずに評価し、破れば段を `stage_output_inconsistent` で止める（下表） |
+| `stages[].maxInputCharacters` | 段の入力の JSON の上限（1〜256,000、既定48,000字）。超えたら推論せずに `stage_input_too_large` |
 | `outputs` | プランの出口。省かれた段を指す参照は `null` になる |
 
 JSON Schema は LLM の構造化出力で使える範囲に限る: `type`（object・array・string・number・integer・boolean・null）、`description`、`properties`、`required`、`additionalProperties: false`、`items`、`enum`、`const`、`anyOf`、`maxItems`・`minItems`、`maxLength`・`minLength`、`minimum`・`maximum`、`$ref`（`#/schemas/…`）。それ以外のキーワードは読込み時に拒否する。段の出力はトップレベルがオブジェクトで、すべてのオブジェクトがプロパティを全部必須にして閉じる（構造化出力の strict 形式）。
@@ -103,7 +105,17 @@ JSON Schema は LLM の構造化出力で使える範囲に限る: `type`（obje
 | `{ "path": "…", "exists": true }` | 値がある（`null` でない） |
 | `{ "all": [条件…] }`・`{ "any": [条件…] }`・`{ "not": 条件 }` | 組合せ |
 
-読込み時に検査すること: 参照先の存在と前後関係、閉じたオブジェクトをたどる参照のキーの存在、条件の参照先、`$ref` の循環、段の数（上限16）、プラン本文の大きさ（256,000字）。省かれうる段の出力を指す参照は `null` として渡す。
+`ensure` の規則の形:
+
+| 形 | 意味 |
+| --- | --- |
+| `{ "when": 条件, "require": 条件 }` | `when` が成り立つなら `require` も成り立つ。参照に `$.output…`（その段の出力）を使える |
+| `{ "each": 参照, "in": 参照 }` | 左の値がすべて右の値の集まりに含まれる。この2つの参照だけ `[*]`（配列の全要素）を使える |
+| `{ "index": 参照, "within": 参照 }` | 左の整数が右の配列の添字として有効。左が null なら検査しない（選ばないことを許す場合。選ぶことを求めるなら `when`/`require` で書く） |
+
+規則の左右の参照について読込み時に確かめること: `index` の左は整数（`type: "integer"`、整数の `enum`/`const`、それを含む `anyOf`）、右は配列。`each`/`in` の両辺は要素に行き着くこと（配列のまま終わる参照は `[*]` の付け忘れとして拒否）と、両辺の型が交わること。`in` の右辺に省かれうる段の出力を使うと、その段が省かれたとき許容集合が空になり違反になる。そうした規則は `when` でその段が動いた場合に限る。キーを `then` にしないのは、規則のオブジェクトが thenable にならないようにするため（`require` を使う）。
+
+読込み時に検査すること: 参照先の存在と前後関係、閉じたオブジェクトをたどる参照のキーの存在、条件と規則の参照先、条件の値が参照先のスキーマで取り得ること（`null` は省かれた段・欠けたキーとして常に取り得る。取り得なければ `condition_value_unreachable`）、`index` の左が整数・右が配列であること、`$ref` の循環と展開後の大きさ（4,000 ノード）、段の数（上限16）、プラン本文の大きさ（256,000字）。省かれうる段の出力を指す参照は `null` として渡す。
 
 ## 4. 実行器
 
@@ -137,9 +149,13 @@ interface LlmPort {
 
 | 規則 | 内容 |
 | --- | --- |
-| 段の結果 | `ran`（推論して出力が検査を通った）／`skipped`（条件で省いた）／`failed`（推論の失敗または出力の検査不合格） |
-| 失敗 | 段が `failed` になったら、そこでプランを止める。再試行は利用側の判断に任せ、実行器は自分で繰り返さない |
-| 取消 | `signal` で途中の段を止め、その実行を `cancelled` として記録する |
+| 段の結果 | `ran`（推論して出力が検査を通った）／`skipped`（条件で省いた）／`failed`（推論の失敗、出力の検査不合格、規則違反、入力の上限超過） |
+| 失敗 | 段が `failed` になったら、そこでプランを止める。`RunResult.failure` に `{ stageId, code, retryable }` を返す。`retryable` は LLM の口が投げたエラーの `retryable === true`（モデルが答えていない）のときだけ true。再試行は利用側の判断に任せ、実行器は自分で繰り返さない |
+| 失敗した段の記録 | 受け取った出力（口がエラーに載せた `raw` を含む）・モデル名・トークン数を段の行に残す。`RunResult` には載せない |
+| 台帳の失敗 | 途中で台帳への書込みが失敗したら、実行を `failed`・`ledger_write_failed` で閉じる書込みを1回試み、元のエラーを投げる |
+| 取消 | `signal` で途中の段を止め、その実行を `cancelled` として記録する。口が signal を無視しても待たない |
+| 再利用 | `reuse: "same_inputs"` で、同じ `subjectRef`・同じプラン本文の直近のライブラリ実行（`library`。エージェントが手で出した `stepwise` の答えは対象外）が `completed` かつ入力の digest が同じなら、推論せずにその結論を返す（`reusedRunId`）。新しい実行の行を1件残す。既定は無効。`subjectRef` がないか台帳が `off` なら常に推論する |
+| 付帯情報 | `context` を実行に付けて台帳に残す。推論には渡さない |
 
 ### 4.2 段ごとに外から進める（MCP・コーディングエージェント向け）
 
@@ -151,7 +167,7 @@ const step = await startRun(plan, inputs, { ledger });
 const next = await submitStage(step.runId, step.stage.id, output, { ledger });
 ```
 
-`submitStage` は出力を段のスキーマで検査する。通らなければ理由を返し、段は進めない。途中の状態は台帳に置く。台帳を無効にしている場合はプロセス内にだけ持つ。
+`submitStage` は出力を段のスキーマと `ensure` で検査する。同じ実行への操作は順番に処理する（同じ段への同時の提出は1件だけが段を進める）。受け付けなかった提出は段ごとに16件まで記録し（本文が16,000字を超えれば字数だけ）、17件目で実行を `failed`・`stage_rejections_exceeded` で閉じる。段が失敗した実行はメモリ上で先に終わらせ、終了の書込みが失敗しても次の段へ進まない（台帳に失敗した段の行があれば、再開時も失敗として扱う）。終わった実行は、今の読込み検査でプランを読み直さず、台帳の記録から返す。通らなければ理由（スキーマの問題、または破った規則の位置 `ensure[i]`）を返し、提出を `rejected` として記録し、段は進めない。入力が上限を超える段に来たら、実行を `failed`・`stage_input_too_large` で閉じて返す。途中の状態は台帳に置く。台帳を無効にしている場合はプロセス内にだけ持つ。
 
 ## 5. 台帳（SQLite）
 
@@ -160,8 +176,8 @@ const next = await submitStage(step.runId, step.stage.id, output, { ledger });
 | 表 | 1行の内容 |
 | --- | --- |
 | `thought_plan_plans` | プランの `id`・`version`・本文の digest・本文 JSON・初めて使った時刻 |
-| `thought_plan_runs` | 実行ID、プランの `id`・`version`・digest、`subjectRef`、実行の方式（`library`／`stepwise`）、入力 JSON、出力 JSON、状態（`running`／`completed`／`failed`／`cancelled`）、開始・終了時刻 |
-| `thought_plan_stages` | 実行ID、段ID、順番、結果（`ran`／`skipped`／`failed`／`rejected`。`rejected` は段ごとに進める実行でスキーマに合わず受け付けなかった提出）、省いた理由の条件、段の入力 JSON、system context の digest、出力 JSON、失敗の理由コード、モデル名・トークン数・所要時間（実行器が受け取った値をそのまま記録）、開始・終了時刻 |
+| `thought_plan_runs` | 実行ID、プランの `id`・`version`・digest、`subjectRef`、実行の方式（`library`／`stepwise`）、入力 JSON、出力 JSON、状態（`running`／`completed`／`failed`／`cancelled`）、開始・終了時刻、入力の digest、再利用元の実行ID、`context`（migration `0002`） |
+| `thought_plan_stages` | 実行ID、段ID、順番、結果（`ran`／`skipped`／`failed`／`rejected`。`rejected` は段ごとに進める実行でスキーマに合わず受け付けなかった提出）、省いた理由の条件、段の入力 JSON、system context の digest、出力 JSON、失敗の理由コード、モデル名・トークン数・所要時間（実行器が受け取った値をそのまま記録。失敗した段も記録する）、`retryable`（migration `0002`）、開始・終了時刻。入力が上限を超えた段は入力の本文を残さず字数だけを残す（実行の行の入力 JSON は、再開と再利用のために本文のまま残す） |
 
 表名はすべて `thought_plan_` で始め、ホストの DB の既存の表と衝突させない。
 
@@ -174,7 +190,12 @@ const next = await submitStage(step.runId, step.stage.id, output, { ledger });
 
 設定は実行ごとに渡す。MCP サーバーは起動時の設定ファイル（`config/thought-plan.json` の `ledger.mode`）で決める。
 
-### 5.3 消去
+### 5.3 消去・後始末・保持
+
+| 関数 | 内容 |
+| --- | --- |
+| `abandonRunsInTransaction(db, { idleSinceMs, mode?, nowMs })` | 最後の動き（開始か、直近の段の終了）が `idleSinceMs` より前のまま `running` の実行を `failed`・`run_abandoned` で閉じる。MCP サーバーは起動時に呼ぶ（24時間）。ホストは起動時の回復処理から呼ぶ |
+| `pruneRunsInTransaction(db, { finishedBeforeMs })` | 古い終了済みの実行と段、どの実行も使わなくなったプランの本文を消す。自動では呼ばない。いつ・何日で呼ぶかは Eumenes への取込みの設計で決める |
 
 単独の台帳は migration の適用記録を `thought_plan_migrations` に持ち、適用済みの SQL が変わっていれば起動を拒否する。
 
@@ -204,15 +225,18 @@ interface LedgerStore {
 
 | 道具 | 入力 | 返すもの |
 | --- | --- | --- |
-| `list_plans` | なし | 使えるプランの `id`・`version`・`description` |
+| `list_plans` | なし | 使えるプランの `id`・`version`・`description`と、設定のディレクトリで読めなかったファイル（`invalid`: ファイル名・コード・場所） |
+| `check_plan` | `document` | 実行せずに読込みの検査だけを行う。通れば入力・段・条件・規則の要約、通らなければコードと場所 |
 | `describe_plan` | `planId` | 入力・段・出力の定義 |
 | `start_plan` | `planId`、`inputs`、任意の `subjectRef` | `runId` と、最初に考えるべき段（`system`・`input`・`outputSchema`）。省ける段は省いてから返す |
 | `submit_stage` | `runId`、`stageId`、`output` | 検査に通れば次の段か、最後なら `outputs`。通らなければ理由 |
-| `get_run` | `runId` | その実行の段ごとの記録 |
-| `list_runs` | 任意の `planId`・`subjectRef`・件数 | 最近の実行の一覧（入力・出力の本文は含めない） |
+| `get_run` | `runId` | その実行の段ごとの記録。失敗した段の出力（使えなかったモデルの答え）は返さない（台帳だけに残る） |
+| `list_runs` | 任意の `planId`・`subjectRef`・件数 | 最近の実行の一覧（入力・出力の本文と `context` は含めない） |
 | `cancel_run` | `runId` | 段を待っている実行を止める |
 
-プランの読込み元は、同梱のパターン（`plans/`）と、設定ファイルで指定したディレクトリ。台帳は §5 の単独の使い方で記録する。LLM の接続先の設定は持たない。MCP のサンプリング（サーバーからクライアントに推論を頼む機能）は、対応するクライアントが限られるため初版には入れない。
+`start_plan` の `inputs` と `submit_stage` の `output` は JSON で256,000字まで（超えたら `payload_too_large`）。起動時に、24時間より前に始まって `running` のままの段ごとの実行を `run_abandoned` で閉じる。版は `package.json` から読む。
+
+プランの読込み元は、同梱のパターン（`plans/`）と、設定ファイルで指定したディレクトリ。同梱プランの不正は起動を止める。設定のディレクトリの不正なファイルは読み込まずに `invalid` に出す。同じ `id`・`version` で本文が違う衝突は起動を止める。台帳は §5 の単独の使い方で記録する。LLM の接続先の設定は持たない。MCP のサンプリング（サーバーからクライアントに推論を頼む機能）は、対応するクライアントが限られるため初版には入れない。
 
 MCP サーバーは一人で使うローカルの道具として扱う。runId を知っていれば、どの実行でも読める。呼び出し元ごとの隔離はしない。台帳をホストと共有する場合でも、段ごとに進める道具が扱えるのは `stepwise` で始めた実行だけにする（ライブラリとして走る実行は再開・取消・提出の対象にしない）。
 
@@ -246,15 +270,15 @@ system context に例示は書かない。各パターンには、固定の入�
 
 ## 9. 実装の順序と合格条件
 
-| 段 | 内容 | 合格条件 |
-| --- | --- | --- |
-| 1 | プランの形式と読込み時の検査 | 参照の誤り・前後関係の誤り・未対応の JSON Schema・同じ版で本文が違うプランを拒否する |
-| 2 | 実行器（ライブラリ） | 条件で省いた段の推論0回。出力の検査不合格で `failed` になり止まる。取消で `cancelled` |
-| 3 | 台帳 | `full` で3表に入出力が残る。`off` で書込み0件。`purgeSubject` で対象の行が0件になる。Eumenes の `SqliteStore` と同じ形の store でも同じ試験が通る |
-| 4 | 段ごとに外から進める実行 | 検査不合格の出力では段が進まない。途中の状態から再開できる（`full` のとき） |
-| 5 | MCP サーバー | Claude Code から `start_plan` → `submit_stage` を通して `outputs` を得る。台帳に記録が残る |
-| 6 | 同梱パターン | 4件それぞれの固定入力の試験 |
-| 7 | Eumenes への取込み | 本家の再設計書の受入条件（目標の1周の記録、失敗後は必ず振り返り、同じ入力では推論0回） |
+| 段 | 内容 | 合格条件 | 固定試験 | 実モデル | 実セッション |
+| --- | --- | --- | --- | --- | --- |
+| 1 | プランの形式と読込み時の検査 | 参照の誤り・前後関係の誤り・未対応の JSON Schema・同じ版で本文が違うプラン・取り得ない条件の値・不正な規則を拒否する | 済 | — | — |
+| 2 | 実行器（ライブラリ） | 条件で省いた段の推論0回。出力の検査不合格・規則違反・入力の上限超過で `failed` になり止まる。取消で `cancelled`。失敗の種類を返す。同じ入力の再利用 | 済 | §10 | — |
+| 3 | 台帳 | `full` で3表に入出力が残る（失敗した段も）。`off` で書込み0件。`purgeSubject` で対象の行が0件になる。Eumenes の `SqliteStore` と同じ形の store でも同じ試験が通る。migration は1回だけ適用 | 済 | — | — |
+| 4 | 段ごとに外から進める実行 | 検査不合格・規則違反の出力では段が進まない。途中の状態から再開できる（`full` のとき） | 済 | — | — |
+| 5 | MCP サーバー | Claude Code から `start_plan` → `submit_stage` を通して `outputs` を得る。台帳に記録が残る | SDK のクライアントと stdio で済 | — | 未（利用者が Claude Code に登録して1回通す） |
+| 6 | 同梱パターン | 4件それぞれの固定入力の試験。実モデルの合格率は §10 | 済 | §10 | — |
+| 7 | Eumenes への取込み | 本家の再設計書の受入条件（目標の1周の記録、失敗後は必ず振り返り、同じ入力では推論0回） | 未 | 未 | 未（本家の再設計書の合意待ち） |
 
 ## 10. ChatGPT API と examples（2026-11-26 追加）
 

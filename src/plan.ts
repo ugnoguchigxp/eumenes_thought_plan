@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { parseCondition, type Condition } from "./conditions";
+import {
+	parseCondition,
+	parseEnsureRule,
+	type Condition,
+	type ConditionLeaf,
+	type EnsureRule,
+} from "./conditions";
 import { PlanError } from "./errors";
 import { checkRefPath, parseRef, type Ref } from "./refs";
 import {
@@ -19,6 +25,10 @@ export const PLAN_LIMITS = {
 	documentCharacters: 256_000,
 	systemCharacters: 32_000,
 	maxOutputTokens: 32_000,
+	/** Default upper bound of a stage's input JSON; a larger input fails the stage without a model call. */
+	stageInputCharacters: 48_000,
+	maxInputCharacters: 256_000,
+	ensureRules: 32,
 } as const;
 const DEFAULT_OUTPUT_TOKENS = 1600;
 const namePattern = /^[A-Za-z][A-Za-z0-9_-]*$/;
@@ -33,7 +43,10 @@ export type LoadedStage = {
 	readonly outputSchema: z.ZodType;
 	readonly runWhen: Condition | null;
 	readonly skipWhen: Condition | null;
+	/** Rules the output must keep beyond its schema; checked without the model. */
+	readonly ensure: readonly EnsureRule[];
 	readonly maxOutputTokens: number;
+	readonly maxInputCharacters: number;
 };
 
 export type LoadedPlan = {
@@ -87,6 +100,37 @@ function record(raw: unknown, where: string): Record<string, unknown> {
 }
 
 /** Parses and checks a plan document (JSON text or the parsed value). Throws `PlanError` on the first fault. */
+/**
+ * The scalar types a schema's values may have (null left out), `integer` also counted as `number` and back;
+ * empty when the schema is not scalar or not known.
+ */
+function scalarTypes(
+	schema: JsonSchema,
+	defs: Readonly<Record<string, JsonSchema>>,
+): Set<string> {
+	const resolved = resolveRef(schema, defs);
+	const types = new Set<string>();
+	const add = (value: unknown) => {
+		if (value === null) return;
+		if (typeof value === "number")
+			types.add(Number.isInteger(value) ? "integer" : "number");
+		else types.add(typeof value);
+	};
+	if (resolved.anyOf)
+		for (const item of resolved.anyOf)
+			for (const type of scalarTypes(item, defs)) types.add(type);
+	else if (resolved.enum) resolved.enum.forEach(add);
+	else if (resolved.const !== undefined) add(resolved.const);
+	else if (
+		resolved.type &&
+		!["object", "array", "null"].includes(resolved.type)
+	)
+		types.add(resolved.type);
+	if (types.has("integer")) types.add("number");
+	else if (types.has("number")) types.add("integer");
+	return types;
+}
+
 export function loadPlan(source: string | unknown): LoadedPlan {
 	const text = typeof source === "string" ? source : JSON.stringify(source);
 	if (text.length > PLAN_LIMITS.documentCharacters)
@@ -152,23 +196,45 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 	)
 		throw new PlanError("plan_stages_invalid", "stages");
 	const earlier = new Map<string, JsonSchema>();
+	/** The schema the reference ends at (undefined past an open object or `anyOf`); throws on a bad path. */
 	const checkRef = (
 		ref: Ref,
 		where: string,
 		upTo: ReadonlyMap<string, JsonSchema>,
+		own?: JsonSchema,
 	) => {
 		const start =
 			ref.root === "inputs"
 				? Object.hasOwn(inputs, ref.name)
 					? inputs[ref.name]
 					: undefined
-				: upTo.get(ref.name);
+				: ref.root === "stage"
+					? upTo.get(ref.name)
+					: own;
 		if (!start)
 			throw new PlanError(
 				ref.root === "inputs" ? "ref_input_unknown" : "ref_stage_not_before",
 				where,
 			);
-		checkRefPath(ref, start, schemas, where);
+		return checkRefPath(ref, start, schemas, where);
+	};
+	/**
+	 * Every value a condition compares a reference to must be one the referenced schema can take (or null, which
+	 * a skipped stage or an absent key reads as), so a misspelt value cannot silently skip a stage forever.
+	 */
+	const checkLeaves = (
+		leaves: readonly ConditionLeaf[],
+		upTo: ReadonlyMap<string, JsonSchema>,
+		own?: JsonSchema,
+	) => {
+		for (const leaf of leaves) {
+			const schema = checkRef(leaf.ref, leaf.where, upTo, own);
+			if (!schema || !leaf.values.length) continue;
+			const type = toZod(schema, schemas);
+			for (const value of leaf.values)
+				if (value !== null && !type.safeParse(value).success)
+					throw new PlanError("condition_value_unreachable", leaf.where);
+		}
 	};
 	const stages = raw.stages.map((item, index): LoadedStage => {
 		const where = `stages[${index}]`;
@@ -183,7 +249,9 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 				"output",
 				"runWhen",
 				"skipWhen",
+				"ensure",
 				"maxOutputTokens",
+				"maxInputCharacters",
 			],
 			where,
 		);
@@ -215,11 +283,56 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 		checkStrict(output, `${where}.output`, schemas);
 		const condition = (key: "runWhen" | "skipWhen") => {
 			if (item[key] === undefined) return null;
-			const refs: Ref[] = [];
-			const parsed = parseCondition(item[key], `${where}.${key}`, refs);
-			for (const ref of refs) checkRef(ref, `${where}.${key}`, earlier);
+			const leaves: ConditionLeaf[] = [];
+			const parsed = parseCondition(item[key], `${where}.${key}`, leaves);
+			checkLeaves(leaves, earlier);
 			return parsed;
 		};
+		if (
+			item.ensure !== undefined &&
+			(!Array.isArray(item.ensure) ||
+				item.ensure.length > PLAN_LIMITS.ensureRules)
+		)
+			throw new PlanError("ensure_invalid", `${where}.ensure`);
+		const ensure = ((item.ensure ?? []) as unknown[]).map((rule, i) => {
+			const at = `${where}.ensure[${i}]`;
+			const leaves: ConditionLeaf[] = [];
+			const parsed = parseEnsureRule(rule, at, leaves);
+			checkLeaves(leaves, earlier, output);
+			if ("index" in parsed) {
+				const index = checkRef(parsed.index, `${at}.index`, earlier, output);
+				const list = checkRef(parsed.within, `${at}.within`, earlier, output);
+				if (
+					(index && !scalarTypes(index, schemas).has("integer")) ||
+					(list && list.type !== "array")
+				)
+					throw new PlanError("ensure_invalid", at);
+			}
+			if ("each" in parsed) {
+				// Both sides must reach elements: an array left unexpanded (no `[*]`) never matches an element.
+				const left = checkRef(parsed.each, `${at}.each`, earlier, output);
+				const right = checkRef(parsed.in, `${at}.in`, earlier, output);
+				if (left?.type === "array" || right?.type === "array")
+					throw new PlanError("ensure_invalid", at);
+				const a = left && scalarTypes(left, schemas);
+				const b = right && scalarTypes(right, schemas);
+				if (a?.size && b?.size && ![...a].some((type) => b.has(type)))
+					throw new PlanError("ensure_invalid", at);
+			}
+			return parsed;
+		});
+		const characters =
+			item.maxInputCharacters ?? PLAN_LIMITS.stageInputCharacters;
+		if (
+			typeof characters !== "number" ||
+			!Number.isInteger(characters) ||
+			characters < 1 ||
+			characters > PLAN_LIMITS.maxInputCharacters
+		)
+			throw new PlanError(
+				"stage_input_limit_invalid",
+				`${where}.maxInputCharacters`,
+			);
 		const tokens = item.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS;
 		if (
 			typeof tokens !== "number" ||
@@ -237,7 +350,9 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 			outputSchema: toZod(output, schemas),
 			runWhen: condition("runWhen"),
 			skipWhen: condition("skipWhen"),
+			ensure,
 			maxOutputTokens: tokens,
+			maxInputCharacters: characters,
 		};
 		earlier.set(stage.id, output);
 		return stage;

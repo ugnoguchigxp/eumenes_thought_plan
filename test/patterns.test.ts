@@ -174,7 +174,7 @@ test("post-failure-reflection: observe, hypothesize and decide what to change, i
 			],
 		},
 		change: {
-			change: "オプション名",
+			change: { controlId: "option", to: "--help で確かめた名前" },
 			avoid: ["同じコマンドの再実行"],
 			sameApproachAllowed: false,
 			nextStep: "--help を読む",
@@ -190,6 +190,7 @@ test("post-failure-reflection: observe, hypothesize and decide what to change, i
 				outcome: "failed",
 			},
 			earlier: [{ approach: "掲載コマンド", observed: "Unknown option" }],
+			controls: [{ id: "option", description: "コマンドのオプション" }],
 		},
 		{ llm: run.llm },
 	);

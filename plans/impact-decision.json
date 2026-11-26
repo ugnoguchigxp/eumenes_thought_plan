@@ -1,6 +1,6 @@
 {
 	"id": "impact-decision",
-	"version": 3,
+	"version": 4,
 	"description": "副作用のある操作の前に、選択肢ごとの影響と取り消せるかを見積もり、許された影響の範囲で一つ選ぶ。範囲を超える選択肢しかなければ確認を求める。",
 	"inputs": {
 		"situation": {
@@ -78,7 +78,13 @@
 				},
 				"required": ["estimates"],
 				"additionalProperties": false
-			}
+			},
+			"ensure": [
+				{
+					"each": "$.output.estimates[*].optionId",
+					"in": "$.inputs.options[*].id"
+				}
+			]
 		},
 		{
 			"id": "choose",
@@ -121,7 +127,41 @@
 				},
 				"required": ["chosen", "needsConfirmation", "confirm", "reason"],
 				"additionalProperties": false
-			}
+			},
+			"ensure": [
+				{
+					"each": "$.output.chosen",
+					"in": "$.inputs.options[*].id"
+				},
+				{
+					"when": {
+						"path": "$.output.needsConfirmation",
+						"equals": true
+					},
+					"require": {
+						"all": [
+							{
+								"path": "$.output.chosen",
+								"exists": false
+							},
+							{
+								"path": "$.output.confirm",
+								"exists": true
+							}
+						]
+					}
+				},
+				{
+					"when": {
+						"path": "$.output.needsConfirmation",
+						"equals": false
+					},
+					"require": {
+						"path": "$.output.chosen",
+						"exists": true
+					}
+				}
+			]
 		}
 	],
 	"outputs": {

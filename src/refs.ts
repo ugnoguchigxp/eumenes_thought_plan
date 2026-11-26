@@ -1,31 +1,44 @@
 import { PlanError } from "./errors";
 import { resolveRef, type JsonSchema } from "./schema";
 
-/** A parsed reference: the plan input or stage it starts at, then object keys and array indexes. */
-export type Ref =
-	| {
-			readonly root: "inputs";
-			readonly name: string;
-			readonly path: readonly Key[];
-	  }
-	| {
-			readonly root: "stage";
-			readonly name: string;
-			readonly path: readonly Key[];
-	  };
+/**
+ * A parsed reference: the plan input, earlier stage or (in an `ensure` rule) the stage's own output it starts
+ * at, then object keys, array indexes and, where allowed, `*` for every element of an array.
+ */
+export type Ref = {
+	readonly root: "inputs" | "stage" | "output";
+	/** The input or stage name; empty for `output`. */
+	readonly name: string;
+	readonly path: readonly Key[];
+};
+/** An object key, an array index, or `"*"` (every element; names never match `*`). */
 type Key = string | number;
+const EVERY = "*";
+
+export type RefOptions = {
+	/** `$.output…` is allowed (inside an `ensure` rule). */
+	readonly output?: boolean;
+	/** `[*]` is allowed (in the operands of `each … in …`). */
+	readonly every?: boolean;
+};
 
 const name = "[A-Za-z][A-Za-z0-9_-]*";
-const head = new RegExp(`^\\$\\.(inputs|stages)\\.(${name})`);
-const segment = new RegExp(`^(?:\\.(${name})|\\[(\\d+)\\])`);
+const head = new RegExp(`^\\$\\.(?:(inputs|stages)\\.(${name})|(output))`);
+const segment = new RegExp(`^(?:\\.(${name})|\\[(\\d+|\\*)\\])`);
 
-/** `$.inputs.<name>…` or `$.stages.<id>.output…`, followed by `.key` and `[index]` segments. */
-export function parseRef(text: unknown, where: string): Ref {
+/** `$.inputs.<name>…`, `$.stages.<id>.output…` or `$.output…`, followed by `.key`, `[index]` and `[*]`. */
+export function parseRef(
+	text: unknown,
+	where: string,
+	options: RefOptions = {},
+): Ref {
 	if (typeof text !== "string") throw new PlanError("ref_invalid", where);
 	const start = head.exec(text);
 	if (!start) throw new PlanError("ref_invalid", where);
 	let rest = text.slice(start[0].length);
-	const root = start[1] === "inputs" ? "inputs" : "stage";
+	const root = start[3] ? "output" : start[1] === "inputs" ? "inputs" : "stage";
+	if (root === "output" && !options.output)
+		throw new PlanError("ref_invalid", where);
 	if (root === "stage") {
 		if (!rest.startsWith(".output")) throw new PlanError("ref_invalid", where);
 		rest = rest.slice(".output".length);
@@ -34,56 +47,73 @@ export function parseRef(text: unknown, where: string): Ref {
 	while (rest) {
 		const match = segment.exec(rest);
 		if (!match) throw new PlanError("ref_invalid", where);
-		path.push(match[1] ?? Number(match[2]));
+		if (match[2] === EVERY && !options.every)
+			throw new PlanError("ref_invalid", where);
+		path.push(match[1] ?? (match[2] === EVERY ? EVERY : Number(match[2])));
 		rest = rest.slice(match[0].length);
 	}
-	return { root, name: start[2]!, path };
+	return { root, name: start[2] ?? "", path };
 }
 
-/** What a reference reads from: the plan's inputs and the stages that ran (a skipped stage has no output). */
+/** What a reference reads from: the plan's inputs, the stages that ran, and the output being checked. */
 export type Scope = {
 	readonly inputs: Readonly<Record<string, unknown>>;
 	readonly stages: ReadonlyMap<string, { readonly output: unknown }>;
+	readonly output?: unknown;
 };
+
+function rootValue(ref: Ref, scope: Scope): unknown {
+	if (ref.root === "output") return scope.output ?? null;
+	if (ref.root === "stage") return scope.stages.get(ref.name)?.output ?? null;
+	return Object.hasOwn(scope.inputs, ref.name)
+		? scope.inputs[ref.name]
+		: undefined;
+}
+
+function step(value: unknown, key: Key): unknown {
+	if (value === null || value === undefined) return undefined;
+	if (typeof key === "number")
+		return Array.isArray(value) ? value[key] : undefined;
+	return typeof value === "object" &&
+		!Array.isArray(value) &&
+		Object.hasOwn(value, key)
+		? (value as Record<string, unknown>)[key]
+		: undefined;
+}
 
 /** The referenced value; anything missing on the way (a skipped stage, an absent key) reads as null. */
 export function readRef(ref: Ref, scope: Scope): unknown {
-	let value: unknown =
-		ref.root === "inputs"
-			? Object.hasOwn(scope.inputs, ref.name)
-				? scope.inputs[ref.name]
-				: undefined
-			: (scope.stages.get(ref.name)?.output ?? null);
-	for (const key of ref.path) {
-		if (value === null || value === undefined) return null;
-		value =
-			typeof key === "number"
-				? Array.isArray(value)
-					? value[key]
-					: undefined
-				: typeof value === "object" &&
-					  !Array.isArray(value) &&
-					  Object.hasOwn(value, key)
-					? (value as Record<string, unknown>)[key]
-					: undefined;
-	}
+	let value = rootValue(ref, scope);
+	for (const key of ref.path) value = step(value, key);
 	return value === undefined ? null : value;
 }
 
+/** Every value the reference reaches, `[*]` expanded; missing values are left out. */
+export function readEvery(ref: Ref, scope: Scope): unknown[] {
+	let values = [rootValue(ref, scope)];
+	for (const key of ref.path)
+		values =
+			key === EVERY
+				? values.flatMap((value) => (Array.isArray(value) ? value : []))
+				: values.map((value) => step(value, key));
+	return values.filter((value) => value !== null && value !== undefined);
+}
+
 /**
- * Follows the path through the schema it starts at, so a typo in a key is a load error. Only closed objects
- * (`additionalProperties: false`) are checked; a key inside an open object or an `anyOf` is accepted.
+ * Follows the path through the schema it starts at, so a typo in a key is a load error, and returns the
+ * schema the path ends at. Only closed objects (`additionalProperties: false`) are checked; past an open
+ * object or an `anyOf` the schema is unknown and `undefined` is returned.
  */
 export function checkRefPath(
 	ref: Ref,
 	start: JsonSchema,
 	defs: Readonly<Record<string, JsonSchema>>,
 	where: string,
-): void {
+): JsonSchema | undefined {
 	let schema: JsonSchema | undefined = resolveRef(start, defs);
 	for (const key of ref.path) {
-		if (!schema || schema.anyOf) return;
-		if (typeof key === "number") {
+		if (!schema || schema.anyOf) return undefined;
+		if (typeof key === "number" || key === EVERY) {
 			if (schema.type !== "array")
 				throw new PlanError("ref_path_unknown", where);
 			schema = schema.items && resolveRef(schema.items, defs);
@@ -98,8 +128,9 @@ export function checkRefPath(
 		if (!next) {
 			if (schema.additionalProperties === false)
 				throw new PlanError("ref_path_unknown", where);
-			return;
+			return undefined;
 		}
 		schema = resolveRef(next, defs);
 	}
+	return schema;
 }
