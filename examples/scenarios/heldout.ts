@@ -20,7 +20,6 @@ const review = (decision: string, extra: Record<string, unknown> = {}) => ({
 	failures: [],
 	changedSinceLast: [],
 	decision,
-	keepPlan: false,
 	reason: "根拠",
 	wait: null,
 	question: null,
@@ -95,7 +94,7 @@ export const heldoutScenarios: Scenario[] = [
 			],
 		},
 		ran: ["review", "plan"],
-		skipped: [],
+		skipped: ["keep"],
 		fixture: {
 			review: review("continue"),
 			plan: planOf("cap:csv-normalizer"),
@@ -155,7 +154,7 @@ export const heldoutScenarios: Scenario[] = [
 			],
 		},
 		ran: ["review"],
-		skipped: ["plan"],
+		skipped: ["keep", "plan"],
 		fixture: {
 			review: review("wait", {
 				wait: {
@@ -220,7 +219,7 @@ export const heldoutScenarios: Scenario[] = [
 			],
 		},
 		ran: ["review", "plan"],
-		skipped: [],
+		skipped: ["keep"],
 		fixture: { review: review("continue"), plan: planOf("cap:policy-read") },
 		checks: (result) => [
 			check(
@@ -266,7 +265,7 @@ export const heldoutScenarios: Scenario[] = [
 			],
 		},
 		ran: ["review"],
-		skipped: ["plan"],
+		skipped: ["keep", "plan"],
 		fixture: {
 			review: review("ask", { question: "結婚記念日は何月何日ですか？" }),
 		},

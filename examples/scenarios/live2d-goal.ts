@@ -110,7 +110,7 @@ export const live2dScenarios: Scenario[] = [
 			capabilities,
 		},
 		ran: ["review", "plan"],
-		skipped: [],
+		skipped: ["keep"],
 		fixture: {
 			review: {
 				done: ["実装ファイルを読んだ", "関連テストの実行を開発監督に7回頼んだ"],
@@ -124,7 +124,6 @@ export const live2dScenarios: Scenario[] = [
 				],
 				changedSinceLast: ["読取許可が再発行された"],
 				decision: "continue",
-				keepPlan: false,
 				reason: "登録検査をまだ試していない",
 				wait: null,
 				question: null,
@@ -312,7 +311,7 @@ export const live2dScenarios: Scenario[] = [
 			capabilities,
 		},
 		ran: [],
-		skipped: ["review", "plan"],
+		skipped: ["review", "keep", "plan"],
 		fixture: {},
 		checks: (result) => [
 			check(

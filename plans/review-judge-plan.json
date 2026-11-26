@@ -1,7 +1,7 @@
 {
 	"id": "review-judge-plan",
-	"version": 4,
-	"description": "継続中の目標について、前回までの経過を振り返り、続けるか判断し、続けるなら方法の候補と影響を見積もって一つ選ぶ。前の手が成功し、計画が残り、前提が変わっていなければ考える段を省く（decision は null になり、利用側は計画の次の手へ進む）。",
+	"version": 5,
+	"description": "継続中の目標について、前回までの経過を振り返り、続けるか判断し、続けるなら方法の候補と影響を見積もって一つ選ぶ。計画が残っているときだけ、残りの計画がまだ有効かを確かめる。前の手が成功し、計画が残り、前提が変わっていなければ考える段を省く（decision は null になり、利用側は計画の次の手へ進む）。",
 	"schemas": {
 		"criterion": {
 			"type": "object",
@@ -106,10 +106,6 @@
 				"decision": {
 					"enum": ["continue", "wait", "ask", "withdraw"]
 				},
-				"keepPlan": {
-					"type": "boolean",
-					"description": "残りの計画がまだ有効で、考え直さずに次の手へ進めるとき true。残りの計画がないときは false"
-				},
 				"reason": {
 					"type": "string"
 				},
@@ -153,7 +149,6 @@
 				"failures",
 				"changedSinceLast",
 				"decision",
-				"keepPlan",
 				"reason",
 				"wait",
 				"question"
@@ -290,6 +285,13 @@
 					"items": {
 						"type": "string"
 					}
+				},
+				"remainingSteps": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "前回立てた計画のうち、まだ実行していない手"
 				}
 			},
 			"required": [
@@ -357,18 +359,44 @@
 						"path": "$.output.question",
 						"exists": true
 					}
-				},
-				{
-					"when": {
-						"path": "$.output.keepPlan",
-						"equals": true
+				}
+			]
+		},
+		{
+			"id": "keep",
+			"description": "残りの計画の見直し",
+			"system": "前回立てた計画の残りの手が、振り返りで分かったことを踏まえてもまだ目標に役立つかを判断する。残りの手が前提にしていたことが変わった、または失敗した方法を含むなら、計画を保たない。",
+			"input": {
+				"goal": "$.inputs.goal",
+				"remainingSteps": "$.inputs.history.remainingSteps",
+				"review": "$.stages.review.output"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"keepPlan": {
+						"type": "boolean"
 					},
-					"require": {
+					"reason": {
+						"type": "string"
+					}
+				},
+				"required": ["keepPlan", "reason"],
+				"additionalProperties": false
+			},
+			"runWhen": {
+				"all": [
+					{
+						"path": "$.stages.review.output.decision",
+						"equals": "continue"
+					},
+					{
 						"path": "$.inputs.history.planRemaining",
 						"equals": true
 					}
-				}
-			]
+				]
+			},
+			"maxOutputTokens": 600
 		},
 		{
 			"id": "plan",
@@ -391,11 +419,11 @@
 					{
 						"any": [
 							{
-								"path": "$.stages.review.output.keepPlan",
+								"path": "$.inputs.history.planRemaining",
 								"equals": false
 							},
 							{
-								"path": "$.inputs.history.planRemaining",
+								"path": "$.stages.keep.output.keepPlan",
 								"equals": false
 							}
 						]
@@ -418,6 +446,7 @@
 	"outputs": {
 		"review": "$.stages.review.output",
 		"decision": "$.stages.review.output.decision",
+		"keepPlan": "$.stages.keep.output.keepPlan",
 		"plan": "$.stages.plan.output"
 	}
 }

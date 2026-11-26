@@ -32,7 +32,6 @@ const review = {
 	failures: [{ approach: "監督に試験を頼む", count: 7, cause: "入力上限" }],
 	changedSinceLast: [],
 	decision: "continue",
-	keepPlan: false,
 	reason: "登録検査をまだ試していない",
 	wait: null,
 	question: null,
@@ -71,13 +70,17 @@ const goalInputs = (history: Record<string, unknown>) => ({
 
 test("review-judge-plan: after a failure it reviews and plans; after a success on a live plan it thinks nothing", async () => {
 	const plan = get("review-judge-plan");
-	const failed = byStage(plan, { review, plan: planOutput });
+	const failed = byStage(plan, {
+		review,
+		keep: { keepPlan: false, reason: "残りの手は失敗した方法を含む" },
+		plan: planOutput,
+	});
 	const result = await runPlan(
 		plan,
 		goalInputs({ lastOutcome: "failed", planRemaining: true, changed: false }),
 		{ llm: failed.llm },
 	);
-	expect(failed.asked).toEqual(["review", "plan"]);
+	expect(failed.asked).toEqual(["review", "keep", "plan"]);
 	expect(result.outputs).toMatchObject({
 		decision: "continue",
 		plan: { chosen: 0 },
@@ -94,7 +97,12 @@ test("review-judge-plan: after a failure it reviews and plans; after a success o
 		{ llm: succeeded.llm },
 	);
 	expect(succeeded.asked).toEqual([]);
-	expect(skipped.outputs).toEqual({ review: null, decision: null, plan: null });
+	expect(skipped.outputs).toEqual({
+		review: null,
+		decision: null,
+		keepPlan: null,
+		plan: null,
+	});
 
 	const changed = byStage(plan, {
 		review: {
@@ -242,4 +250,29 @@ test("impact-decision: estimates every option, then chooses within the allowed e
 	);
 	expect(run.asked).toEqual(["estimate", "choose"]);
 	expect(result.outputs).toMatchObject({ decision: { chosen: "a" } });
+});
+
+test("review-judge-plan: with a plan left, a kept plan skips planning and a dropped one plans again", async () => {
+	const plan = get("review-judge-plan");
+	const inputs = goalInputs({
+		lastOutcome: "partial",
+		planRemaining: true,
+		changed: true,
+		remainingSteps: ["登録検査を実行する"],
+	});
+	const kept = byStage(plan, {
+		review,
+		keep: { keepPlan: true, reason: "残りの手はまだ有効" },
+	});
+	const keptResult = await runPlan(plan, inputs, { llm: kept.llm });
+	expect(kept.asked).toEqual(["review", "keep"]);
+	expect(keptResult.outputs).toMatchObject({ keepPlan: true, plan: null });
+
+	const dropped = byStage(plan, {
+		review,
+		keep: { keepPlan: false, reason: "前提が変わった" },
+		plan: planOutput,
+	});
+	await runPlan(plan, inputs, { llm: dropped.llm });
+	expect(dropped.asked).toEqual(["review", "keep", "plan"]);
 });

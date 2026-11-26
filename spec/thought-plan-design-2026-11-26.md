@@ -314,3 +314,36 @@ system context に例示は書かない。各パターンには、固定の入�
 | キーあり（2回目） | 1,590 中 1,587（99.8%） |
 
 入力が1,024トークン未満の段（他のプランの段のほとんど）は、提供側の仕様でキャッシュの対象にならない。
+
+### 繰り返し測定（2026-11-26、0.2.0、gpt-6-luna・effort low）
+
+`bun run examples -- --repeat 30 --concurrency 4`。モデルが答えなかった実行（通信・上限・設定）は分母から外す仕組みだが、今回は0件。合格条件は、調整用が各27/30以上・合計95%以上、検証用が各24/30以上・合計90%以上。
+
+| 区分 | シナリオ | プラン | 合格 |
+| --- | --- | --- | --- |
+| 調整用 | live2d-goal-stalled | review-judge-plan@5 | 30/30 |
+| 調整用 | live2d-goal-reflection | post-failure-reflection@3 | 28/30 |
+| 調整用 | goal-without-means | review-judge-plan@5 | 30/30 |
+| 調整用 | readme-command-failed | plan-execute-replan@1 | 29/30 |
+| 調整用 | readme-first-plan | plan-execute-replan@1 | 30/30 |
+| 調整用 | impact-undo-own-changes | impact-decision@4 | 28/30 |
+| 調整用 | impact-outside-limits | impact-decision@4 | 30/30 |
+| 調整用 | triage-crash | code-triage@1 | 30/30 |
+| 調整用 | triage-typo | code-triage@1 | 30/30 |
+| 調整用 | live2d-goal-on-plan | review-judge-plan@5 | 推論0回（集計外、1/1） |
+| **調整用の合計** | | | **265/270（98.1%）** |
+| 検証用 | heldout-review-other-capability・external-wait・plan-exhausted・needs-owner | review-judge-plan@5 | 各30/30 |
+| 検証用 | heldout-reflection-first-failure・permission-denied | post-failure-reflection@3 | 各30/30 |
+| 検証用 | heldout-reflection-transient | post-failure-reflection@3 | 26/30（4回は一時的な障害の後に同じ方法の再使用を許さなかった） |
+| 検証用 | heldout-replan-missed-constraint・external-change | plan-execute-replan@1 | 各30/30 |
+| 検証用 | heldout-impact-single-irreversible・shared-db-only・no-change | impact-decision@4 | 各30/30 |
+| **検証用の合計** | | | **356/360（98.9%）** |
+
+途中の版の結果と、そこから変えたこと:
+
+| 版 | 結果 | 変更 |
+| --- | --- | --- |
+| review-judge-plan@4 | live2d-goal-stalled 20/30。9回は計画が残っていないのに `keepPlan: true` を返し、`ensure` で `stage_output_inconsistent` になった | 版5: 振り返りの段から `keepPlan` を外し、計画が残っていて続けるときだけ別の段 `keep`（残りの手 `remainingSteps` を入力に持つ）で聞く |
+| post-failure-reflection@2 | live2d-goal-reflection 27/30。3回は入力上限の失敗を依頼文の言い回しで直せるとした | 版3: 変える条件は「観測された原因に直接効くもの」を選ぶ、と指示に足した |
+
+検証用の結果は、取り決めどおり指示文の調整に使っていない。費用は調整用の初回約0.10ドル（531回）、調整用の測り直し約0.04ドル（180回）、検証用約0.14ドル（750回）。

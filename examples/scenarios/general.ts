@@ -38,7 +38,7 @@ export const generalScenarios: Scenario[] = [
 			capabilities: [],
 		},
 		ran: ["review"],
-		skipped: ["plan"],
+		skipped: ["keep", "plan"],
 		fixture: {
 			review: {
 				done: ["登録を試した"],
@@ -52,7 +52,6 @@ export const generalScenarios: Scenario[] = [
 				],
 				changedSinceLast: [],
 				decision: "ask",
-				keepPlan: false,
 				reason: "手段がない",
 				wait: null,
 				question: "時刻で動かせる実行先を登録できますか？",
