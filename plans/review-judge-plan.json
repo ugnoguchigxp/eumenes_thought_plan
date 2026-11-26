@@ -1,0 +1,263 @@
+{
+	"id": "review-judge-plan",
+	"version": 1,
+	"description": "継続中の目標について、前回までの経過を振り返り、続けるか判断し、続けるなら方法の候補と影響を見積もって一つ選ぶ。前の手が成功し、計画が残り、前提が変わっていなければ考える段を省く（decision は null になり、利用側は計画の次の手へ進む）。",
+	"schemas": {
+		"criterion": {
+			"type": "object",
+			"properties": {
+				"id": { "type": "string" },
+				"text": { "type": "string" },
+				"status": { "enum": ["open", "passed"] }
+			},
+			"required": ["id", "text", "status"],
+			"additionalProperties": false
+		},
+		"attempt": {
+			"type": "object",
+			"properties": {
+				"approach": { "type": "string" },
+				"outcome": {
+					"enum": ["succeeded", "partial", "failed", "rejected", "cancelled"]
+				},
+				"observed": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+			},
+			"required": ["approach", "outcome", "observed"]
+		},
+		"capability": {
+			"type": "object",
+			"properties": {
+				"ref": { "type": "string" },
+				"description": { "type": "string" },
+				"effect": { "enum": ["read", "write", "external"] }
+			},
+			"required": ["ref", "description", "effect"]
+		},
+		"review": {
+			"type": "object",
+			"properties": {
+				"done": {
+					"type": "array",
+					"items": { "type": "string" },
+					"maxItems": 12,
+					"description": "これまでに実際に行ったこと"
+				},
+				"learned": {
+					"type": "array",
+					"items": { "type": "string" },
+					"maxItems": 12,
+					"description": "観測から分かったこと"
+				},
+				"failures": {
+					"type": "array",
+					"maxItems": 8,
+					"items": {
+						"type": "object",
+						"properties": {
+							"approach": { "type": "string" },
+							"count": { "type": "integer", "minimum": 1 },
+							"cause": { "type": "string" }
+						},
+						"required": ["approach", "count", "cause"],
+						"additionalProperties": false
+					}
+				},
+				"changedSinceLast": {
+					"type": "array",
+					"items": { "type": "string" },
+					"maxItems": 8
+				},
+				"decision": { "enum": ["continue", "wait", "ask", "withdraw"] },
+				"keepPlan": {
+					"type": "boolean",
+					"description": "残りの計画がまだ有効で、考え直さずに次の手へ進めるとき true"
+				},
+				"reason": { "type": "string" },
+				"wait": {
+					"anyOf": [
+						{
+							"type": "object",
+							"properties": {
+								"until": {
+									"type": "string",
+									"description": "待つ対象と成立条件"
+								},
+								"recheckAfterMinutes": { "type": "integer", "minimum": 1 }
+							},
+							"required": ["until", "recheckAfterMinutes"],
+							"additionalProperties": false
+						},
+						{ "type": "null" }
+					]
+				},
+				"question": {
+					"anyOf": [{ "type": "string" }, { "type": "null" }],
+					"description": "本人にしか解けない一点"
+				}
+			},
+			"required": [
+				"done",
+				"learned",
+				"failures",
+				"changedSinceLast",
+				"decision",
+				"keepPlan",
+				"reason",
+				"wait",
+				"question"
+			],
+			"additionalProperties": false
+		},
+		"plan": {
+			"type": "object",
+			"properties": {
+				"candidates": {
+					"type": "array",
+					"minItems": 1,
+					"maxItems": 3,
+					"items": {
+						"type": "object",
+						"properties": {
+							"approach": { "type": "string" },
+							"steps": {
+								"type": "array",
+								"minItems": 1,
+								"maxItems": 5,
+								"items": {
+									"type": "object",
+									"properties": {
+										"capabilityRef": { "type": "string" },
+										"request": { "type": "string" },
+										"proceedWhen": {
+											"type": "string",
+											"description": "何が観測できれば次の手へ進むか"
+										}
+									},
+									"required": ["capabilityRef", "request", "proceedWhen"],
+									"additionalProperties": false
+								}
+							},
+							"impact": {
+								"type": "object",
+								"properties": {
+									"changes": { "enum": ["none", "files", "external"] },
+									"reversible": { "type": "boolean" },
+									"inferenceCalls": { "type": "integer", "minimum": 0 },
+									"minutes": { "type": "number", "minimum": 0 },
+									"ifFails": { "type": "string" }
+								},
+								"required": [
+									"changes",
+									"reversible",
+									"inferenceCalls",
+									"minutes",
+									"ifFails"
+								],
+								"additionalProperties": false
+							}
+						},
+						"required": ["approach", "steps", "impact"],
+						"additionalProperties": false
+					}
+				},
+				"chosen": { "type": "integer", "minimum": 0, "maximum": 2 },
+				"reason": { "type": "string" }
+			},
+			"required": ["candidates", "chosen", "reason"],
+			"additionalProperties": false
+		}
+	},
+	"inputs": {
+		"goal": {
+			"type": "object",
+			"properties": {
+				"text": { "type": "string" },
+				"criteria": {
+					"type": "array",
+					"items": { "$ref": "#/schemas/criterion" }
+				}
+			},
+			"required": ["text", "criteria"]
+		},
+		"history": {
+			"type": "object",
+			"properties": {
+				"attempts": {
+					"type": "array",
+					"items": { "$ref": "#/schemas/attempt" }
+				},
+				"lastOutcome": {
+					"enum": [
+						"none",
+						"succeeded",
+						"partial",
+						"failed",
+						"rejected",
+						"cancelled"
+					]
+				},
+				"planRemaining": { "type": "boolean" },
+				"changed": {
+					"type": "boolean",
+					"description": "前回から許可・能力・資料が変わったか"
+				},
+				"changes": { "type": "array", "items": { "type": "string" } }
+			},
+			"required": [
+				"attempts",
+				"lastOutcome",
+				"planRemaining",
+				"changed",
+				"changes"
+			]
+		},
+		"capabilities": {
+			"type": "array",
+			"items": { "$ref": "#/schemas/capability" }
+		}
+	},
+	"stages": [
+		{
+			"id": "review",
+			"description": "振り返りと継続の判断",
+			"system": "登録された目標の経過を振り返る。試行と観測だけを根拠に、これまでに行ったこと、分かったこと、失敗した方法とその原因、前回から変わったことをまとめる。そのうえで続けるかを判断する。新しい根拠なしに同じ方法が繰り返し失敗しているなら、その方法で続けると判断しない。待つときは待つ対象と見直す時期を、本人に聞くときは本人にしか解けない一点を示す。元の達成条件は変えない。",
+			"input": {
+				"goal": "$.inputs.goal",
+				"history": "$.inputs.history",
+				"capabilities": "$.inputs.capabilities"
+			},
+			"output": { "$ref": "#/schemas/review" },
+			"skipWhen": {
+				"all": [
+					{ "path": "$.inputs.history.lastOutcome", "equals": "succeeded" },
+					{ "path": "$.inputs.history.planRemaining", "equals": true },
+					{ "path": "$.inputs.history.changed", "equals": false }
+				]
+			},
+			"maxOutputTokens": 2400
+		},
+		{
+			"id": "plan",
+			"description": "方法の候補と影響の見積もり",
+			"system": "未達の達成条件に対して、提示された能力だけで実行できる方法の候補を最大3件挙げる。各候補は最大5手の手順にし、各手で何が観測できれば次へ進むかを書く。候補ごとに影響（変更の有無と範囲、取り消せるか、推論の回数、所要時間、失敗したときの影響）を見積もる。振り返りで失敗した方法は、変わった条件がない限り候補にしない。影響が小さく、条件を実物で確かめられる候補を選び、理由を書く。",
+			"input": {
+				"goal": "$.inputs.goal",
+				"review": "$.stages.review.output",
+				"capabilities": "$.inputs.capabilities"
+			},
+			"output": { "$ref": "#/schemas/plan" },
+			"runWhen": {
+				"all": [
+					{ "path": "$.stages.review.output.decision", "equals": "continue" },
+					{ "path": "$.stages.review.output.keepPlan", "equals": false }
+				]
+			},
+			"maxOutputTokens": 3200
+		}
+	],
+	"outputs": {
+		"review": "$.stages.review.output",
+		"decision": "$.stages.review.output.decision",
+		"plan": "$.stages.plan.output"
+	}
+}

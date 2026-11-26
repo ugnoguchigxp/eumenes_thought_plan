@@ -1,0 +1,106 @@
+{
+	"id": "plan-execute-replan",
+	"version": 1,
+	"description": "手順のある作業を計画する。実行は利用側が行い、結果を渡して再び呼ぶ。前の手が成功していれば考えずに進め、失敗・部分達成のときだけ結果と計画を照合して計画を立て直す。",
+	"schemas": {
+		"step": {
+			"type": "object",
+			"properties": {
+				"action": { "type": "string" },
+				"proceedWhen": {
+					"type": "string",
+					"description": "何が観測できれば次の手へ進むか"
+				}
+			},
+			"required": ["action", "proceedWhen"],
+			"additionalProperties": false
+		}
+	},
+	"inputs": {
+		"task": { "type": "string" },
+		"constraints": { "type": "array", "items": { "type": "string" } },
+		"progress": {
+			"type": "object",
+			"properties": {
+				"done": {
+					"type": "array",
+					"items": {
+						"type": "object",
+						"properties": {
+							"action": { "type": "string" },
+							"outcome": { "enum": ["succeeded", "partial", "failed"] },
+							"observed": { "type": "string" }
+						},
+						"required": ["action", "outcome", "observed"]
+					}
+				},
+				"lastOutcome": { "enum": ["none", "succeeded", "partial", "failed"] },
+				"remaining": { "type": "array", "items": { "type": "string" } }
+			},
+			"required": ["done", "lastOutcome", "remaining"]
+		}
+	},
+	"stages": [
+		{
+			"id": "assess",
+			"description": "結果と計画の照合",
+			"system": "直前の手の観測を、計画でその手に期待した結果と照合する。ずれの原因を観測から推定し、同じ手をもう一度試す価値があるか、計画を立て直すか、作業をやめるかを決める。同じ手を繰り返すのは、前回から条件が変わったと言えるときだけにする。",
+			"input": {
+				"task": "$.inputs.task",
+				"constraints": "$.inputs.constraints",
+				"progress": "$.inputs.progress"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"matchesPlan": { "type": "boolean" },
+					"cause": { "type": "string" },
+					"decision": { "enum": ["retry_same", "replan", "stop"] },
+					"reason": { "type": "string" }
+				},
+				"required": ["matchesPlan", "cause", "decision", "reason"],
+				"additionalProperties": false
+			},
+			"runWhen": {
+				"path": "$.inputs.progress.lastOutcome",
+				"in": ["partial", "failed"]
+			}
+		},
+		{
+			"id": "plan",
+			"description": "計画・再計画",
+			"system": "作業を、実行して結果を観測できる手の列にする。各手に、何が観測できれば次へ進むかを書く。制約を守る。照合の結果がある場合は、ずれの原因を避ける手順にし、済んだ手は繰り返さない。",
+			"input": {
+				"task": "$.inputs.task",
+				"constraints": "$.inputs.constraints",
+				"progress": "$.inputs.progress",
+				"assessment": "$.stages.assess.output"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"steps": {
+						"type": "array",
+						"minItems": 1,
+						"maxItems": 8,
+						"items": { "$ref": "#/schemas/step" }
+					},
+					"reason": { "type": "string" }
+				},
+				"required": ["steps", "reason"],
+				"additionalProperties": false
+			},
+			"runWhen": {
+				"any": [
+					{ "path": "$.inputs.progress.lastOutcome", "equals": "none" },
+					{ "path": "$.stages.assess.output.decision", "equals": "replan" }
+				]
+			},
+			"maxOutputTokens": 2400
+		}
+	],
+	"outputs": {
+		"assessment": "$.stages.assess.output",
+		"plan": "$.stages.plan.output"
+	}
+}

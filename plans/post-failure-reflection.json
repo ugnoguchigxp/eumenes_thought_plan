@@ -1,0 +1,116 @@
+{
+	"id": "post-failure-reflection",
+	"version": 1,
+	"description": "失敗の直後に、観測を整理し、原因の仮説を立て、次に変える条件と避ける方法を決める。同じ手を考えずに繰り返さないための振り返り。",
+	"inputs": {
+		"attempt": {
+			"type": "object",
+			"properties": {
+				"approach": { "type": "string" },
+				"request": { "type": "string" },
+				"observed": { "type": "string" },
+				"outcome": { "enum": ["partial", "failed", "rejected"] }
+			},
+			"required": ["approach", "request", "observed", "outcome"]
+		},
+		"earlier": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"properties": {
+					"approach": { "type": "string" },
+					"observed": { "type": "string" }
+				},
+				"required": ["approach", "observed"]
+			}
+		}
+	},
+	"stages": [
+		{
+			"id": "observe",
+			"description": "観測の整理",
+			"system": "失敗した試行で実際に観測された事実と、観測されていない未確認の点を分けて列挙する。推測は事実に含めない。以前の試行と同じ観測があれば対応付ける。",
+			"input": { "attempt": "$.inputs.attempt", "earlier": "$.inputs.earlier" },
+			"output": {
+				"type": "object",
+				"properties": {
+					"facts": {
+						"type": "array",
+						"items": { "type": "string" },
+						"maxItems": 12
+					},
+					"unknowns": {
+						"type": "array",
+						"items": { "type": "string" },
+						"maxItems": 8
+					},
+					"repeatsEarlier": { "type": "boolean" }
+				},
+				"required": ["facts", "unknowns", "repeatsEarlier"],
+				"additionalProperties": false
+			}
+		},
+		{
+			"id": "hypothesize",
+			"description": "原因の仮説",
+			"system": "整理した事実から、失敗の原因の仮説を挙げる。各仮説に、それを支持する事実と、確かめる方法を書く。事実で支持されない仮説は確からしさを低くする。",
+			"input": {
+				"attempt": "$.inputs.attempt",
+				"observation": "$.stages.observe.output"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"hypotheses": {
+						"type": "array",
+						"minItems": 1,
+						"maxItems": 4,
+						"items": {
+							"type": "object",
+							"properties": {
+								"cause": { "type": "string" },
+								"support": { "type": "array", "items": { "type": "string" } },
+								"check": { "type": "string" },
+								"likelihood": { "enum": ["high", "medium", "low"] }
+							},
+							"required": ["cause", "support", "check", "likelihood"],
+							"additionalProperties": false
+						}
+					}
+				},
+				"required": ["hypotheses"],
+				"additionalProperties": false
+			}
+		},
+		{
+			"id": "change",
+			"description": "次に変える条件",
+			"system": "仮説をもとに、次の試行で変える条件と、避ける方法を決める。同じ方法をもう一度使ってよいのは、変える条件があるときだけにする。仮説を確かめる手が先に必要なら、それを次の手にする。",
+			"input": {
+				"attempt": "$.inputs.attempt",
+				"observation": "$.stages.observe.output",
+				"hypotheses": "$.stages.hypothesize.output.hypotheses"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"change": { "type": "string" },
+					"avoid": {
+						"type": "array",
+						"items": { "type": "string" },
+						"maxItems": 6
+					},
+					"sameApproachAllowed": { "type": "boolean" },
+					"nextStep": { "type": "string" }
+				},
+				"required": ["change", "avoid", "sameApproachAllowed", "nextStep"],
+				"additionalProperties": false
+			}
+		}
+	],
+	"outputs": {
+		"observation": "$.stages.observe.output",
+		"hypotheses": "$.stages.hypothesize.output.hypotheses",
+		"next": "$.stages.change.output"
+	}
+}

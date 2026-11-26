@@ -1,0 +1,4 @@
+{
+	"ledger": { "mode": "full", "path": "../data/thought-plan.sqlite" },
+	"planDirectories": []
+}

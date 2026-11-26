@@ -1,0 +1,24 @@
+[install]
+peer = false
+
+# `bun fmt` (scripts `format` / `format:check`), the same settings as the Eumenes host. Linting uses `oxlint`; `bun check` type-checks.
+[fmt]
+useTabs = true
+tabWidth = 2
+printWidth = 80
+singleQuote = false
+jsxSingleQuote = false
+quoteProps = "as-needed"
+trailingComma = "all"
+semi = true
+arrowParens = "always"
+bracketSameLine = false
+bracketSpacing = true
+sortPackageJson = false
+ignorePatterns = [
+	"**/*.md",
+	"node_modules/**",
+	"dist/**",
+	"data/**",
+	"artifacts/**",
+]

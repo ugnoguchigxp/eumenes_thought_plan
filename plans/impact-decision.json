@@ -1,0 +1,91 @@
+{
+	"id": "impact-decision",
+	"version": 1,
+	"description": "副作用のある操作の前に、選択肢ごとの影響と取り消せるかを見積もり、許された影響の範囲で一つ選ぶ。範囲を超える選択肢しかなければ確認を求める。",
+	"inputs": {
+		"situation": { "type": "string" },
+		"options": {
+			"type": "array",
+			"minItems": 1,
+			"items": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"description": { "type": "string" }
+				},
+				"required": ["id", "description"]
+			}
+		},
+		"allowedEffects": {
+			"type": "array",
+			"items": { "enum": ["none", "local_files", "shared_state", "external"] }
+		}
+	},
+	"stages": [
+		{
+			"id": "estimate",
+			"description": "影響の見積もり",
+			"system": "各選択肢について、実行したときに変わるもの、その範囲、取り消せるか、失敗したときに何が残るかを見積もる。見積もりは状況の記述から言えることに限り、分からない点は不明として書く。",
+			"input": {
+				"situation": "$.inputs.situation",
+				"options": "$.inputs.options"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"estimates": {
+						"type": "array",
+						"minItems": 1,
+						"items": {
+							"type": "object",
+							"properties": {
+								"optionId": { "type": "string" },
+								"effect": {
+									"enum": ["none", "local_files", "shared_state", "external"]
+								},
+								"scope": { "type": "string" },
+								"reversible": { "enum": ["yes", "partly", "no", "unknown"] },
+								"ifFails": { "type": "string" }
+							},
+							"required": [
+								"optionId",
+								"effect",
+								"scope",
+								"reversible",
+								"ifFails"
+							],
+							"additionalProperties": false
+						}
+					}
+				},
+				"required": ["estimates"],
+				"additionalProperties": false
+			}
+		},
+		{
+			"id": "choose",
+			"description": "選択",
+			"system": "許された影響の範囲に収まる選択肢から、目的を果たせて影響と取り消せなさが最も小さいものを選ぶ。範囲に収まる選択肢がなければ、選ばずに確認を求め、確認したい点を一つ書く。",
+			"input": {
+				"situation": "$.inputs.situation",
+				"allowedEffects": "$.inputs.allowedEffects",
+				"estimates": "$.stages.estimate.output.estimates"
+			},
+			"output": {
+				"type": "object",
+				"properties": {
+					"chosen": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+					"needsConfirmation": { "type": "boolean" },
+					"confirm": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+					"reason": { "type": "string" }
+				},
+				"required": ["chosen", "needsConfirmation", "confirm", "reason"],
+				"additionalProperties": false
+			}
+		}
+	],
+	"outputs": {
+		"estimates": "$.stages.estimate.output.estimates",
+		"decision": "$.stages.choose.output"
+	}
+}
