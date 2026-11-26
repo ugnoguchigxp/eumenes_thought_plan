@@ -22,7 +22,7 @@ import {
 import type { LlmPort } from "../src/llm";
 import type { LoadedPlan } from "../src/plan";
 import { bundledPlans, loadPlanDirectory, mergePlans } from "../src/plans";
-import { runPlan, type RunResult } from "../src/run";
+import { continuePlan, runPlan, type RunResult } from "../src/run";
 import {
 	createOpenAILlm,
 	createSpendMeter,
@@ -30,10 +30,12 @@ import {
 } from "../standalone/openai";
 import type { Check, Scenario } from "./scenario";
 import { generalScenarios } from "./scenarios/general";
+import { goalPursuitScenarios } from "./scenarios/goal-pursuit";
 import { heldoutScenarios } from "./scenarios/heldout";
 import { live2dScenarios } from "./scenarios/live2d-goal";
 
 export const scenarios: readonly Scenario[] = [
+	...goalPursuitScenarios,
 	...live2dScenarios,
 	...generalScenarios,
 	...heldoutScenarios,
@@ -52,18 +54,29 @@ export function planOf(scenario: Scenario, plans: readonly LoadedPlan[]) {
 	return plan;
 }
 
-/** A model that answers from the scenario's fixture, keyed by the stage it is asked for. */
+/**
+ * A model that answers from the scenario's fixtures, keyed by the stage it is asked for: a stage asked again in
+ * a later round takes the next round's answer for it.
+ */
 export function fixtureLlm(scenario: Scenario, plan: LoadedPlan): LlmPort {
 	const stageOf = new Map(plan.stages.map((stage) => [stage.system, stage.id]));
+	const queues = new Map<string, unknown[]>();
+	for (const fixture of [
+		scenario.fixture,
+		...(scenario.rounds ?? []).map(({ fixture }) => fixture),
+	])
+		for (const [id, answer] of Object.entries(fixture))
+			queues.set(id, [...(queues.get(id) ?? []), answer]);
 	return {
 		async complete(request) {
 			const id = stageOf.get(request.system);
-			if (!id || !(id in scenario.fixture))
+			const queue = id ? queues.get(id) : undefined;
+			if (!queue?.length)
 				throw Object.assign(new Error("fixture_stage_missing"), {
 					code: "fixture_stage_missing",
 				});
 			return {
-				value: request.schema.parse(scenario.fixture[id]),
+				value: request.schema.parse(queue.shift()),
 				model: "fixture",
 				inputTokens: 0,
 				outputTokens: 0,
@@ -110,28 +123,52 @@ export async function runScenario(
 		subjectRef: `example:${scenario.id}`,
 		context: { scenario: scenario.id, set: scenario.set, ...input.context },
 	});
-	const ids = (status: string) =>
-		result.stages
-			.filter((stage) => stage.status === status)
-			.map(({ id }) => id);
-	const checks: Check[] = [
-		{
-			name: "実行が完了する",
-			ok: result.status === "completed",
-			detail: `${result.status}${result.errorCode ? ` ${result.errorCode}` : ""}`,
-		},
-		{
-			name: "動いた段",
-			ok: JSON.stringify(ids("ran")) === JSON.stringify(scenario.ran),
-			detail: `期待 ${JSON.stringify(scenario.ran)} / 実際 ${JSON.stringify(ids("ran"))}`,
-		},
-		{
-			name: "省いた段",
-			ok: JSON.stringify(ids("skipped")) === JSON.stringify(scenario.skipped),
-			detail: `期待 ${JSON.stringify(scenario.skipped)} / 実際 ${JSON.stringify(ids("skipped"))}`,
-		},
-		...(result.status === "completed" ? scenario.checks(result) : []),
-	];
+	const roundChecks = (
+		at: RunResult,
+		expected: { ran: readonly string[]; skipped: readonly string[] },
+		own: ((result: RunResult) => readonly Check[]) | undefined,
+		label: string,
+	): Check[] => {
+		const ids = (status: string) =>
+			at.stages.filter((stage) => stage.status === status).map(({ id }) => id);
+		return [
+			{
+				name: `${label}実行が完了する`,
+				ok: at.status === "completed",
+				detail: `${at.status}${at.errorCode ? ` ${at.errorCode}` : ""}`,
+			},
+			{
+				name: `${label}動いた段`,
+				ok: JSON.stringify(ids("ran")) === JSON.stringify(expected.ran),
+				detail: `期待 ${JSON.stringify(expected.ran)} / 実際 ${JSON.stringify(ids("ran"))}`,
+			},
+			{
+				name: `${label}省いた段`,
+				ok: JSON.stringify(ids("skipped")) === JSON.stringify(expected.skipped),
+				detail: `期待 ${JSON.stringify(expected.skipped)} / 実際 ${JSON.stringify(ids("skipped"))}`,
+			},
+			...(at.status === "completed" && own ? own(at) : []),
+		];
+	};
+	const checks: Check[] = roundChecks(result, scenario, scenario.checks, "");
+	// Each later round continues the same run and session with what the executed step returned.
+	let last = result;
+	for (const [index, round] of (scenario.rounds ?? []).entries()) {
+		if (!last.state) break;
+		last = await continuePlan(input.plan, last.state, round.input, {
+			llm: counted,
+			ledger: input.ledger,
+		});
+		checks.push(
+			...roundChecks(last, round, round.checks, `ラウンド${index + 2}: `),
+		);
+	}
+	if (scenario.rounds?.length && last.round !== scenario.rounds.length + 1)
+		checks.push({
+			name: "すべてのラウンドを実行する",
+			ok: false,
+			detail: `ラウンド${last.round}で止まった`,
+		});
 	return {
 		id: scenario.id,
 		ok: checks.every(({ ok }) => ok),

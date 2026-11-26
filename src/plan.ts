@@ -29,6 +29,7 @@ export const PLAN_LIMITS = {
 	stageInputCharacters: 48_000,
 	maxInputCharacters: 256_000,
 	ensureRules: 32,
+	rounds: 16,
 } as const;
 const DEFAULT_OUTPUT_TOKENS = 1600;
 const namePattern = /^[A-Za-z][A-Za-z0-9_-]*$/;
@@ -47,6 +48,21 @@ export type LoadedStage = {
 	readonly ensure: readonly EnsureRule[];
 	readonly maxOutputTokens: number;
 	readonly maxInputCharacters: number;
+	/** `inherit`: the stage continues the run's session; `independent`: it starts one of its own. */
+	readonly session: "inherit" | "independent";
+	/** Whether the stage's call may reuse the session's input cache. */
+	readonly cache: boolean;
+	/** The rounds the stage runs in: the first, every later one, or every one. */
+	readonly round: StageRound;
+};
+
+export type StageRound = "first" | "later" | "every";
+
+/** The later rounds of a run: how many a run may have in all, and what each later round takes in. */
+export type LoadedRounds = {
+	readonly max: number;
+	readonly inputs: Readonly<Record<string, JsonSchema>>;
+	readonly inputSchema: z.ZodType<Record<string, unknown>>;
 };
 
 export type LoadedPlan = {
@@ -61,6 +77,8 @@ export type LoadedPlan = {
 	readonly inputSchema: z.ZodType<Record<string, unknown>>;
 	readonly stages: readonly LoadedStage[];
 	readonly outputs: readonly { readonly key: string; readonly ref: Ref }[];
+	/** Null when the plan has a single round. */
+	readonly rounds: LoadedRounds | null;
 };
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -68,9 +86,11 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
 
 /** JSON with object keys in sorted order, so equal documents give equal text. */
 export function canonicalJson(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (Array.isArray(value))
+		return `[${value.map((item) => (item === undefined ? "null" : canonicalJson(item))).join(",")}]`;
 	if (isObject(value))
 		return `{${Object.keys(value)
+			.filter((key) => value[key] !== undefined)
 			.sort()
 			.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
 			.join(",")}}`;
@@ -144,7 +164,17 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 	if (!isObject(raw)) throw new PlanError("plan_invalid", "document");
 	only(
 		raw,
-		["id", "version", "description", "schemas", "inputs", "stages", "outputs"],
+		[
+			"id",
+			"version",
+			"description",
+			"schemas",
+			"inputs",
+			"stages",
+			"outputs",
+			"session",
+			"rounds",
+		],
 		"",
 	);
 	if (typeof raw.id !== "string" || !planIdPattern.test(raw.id))
@@ -189,6 +219,9 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 		),
 	) as unknown as z.ZodType<Record<string, unknown>>;
 
+	const session = sessionDefaults(raw.session);
+	const rounds = loadRounds(raw.rounds, names, schemas, bounded);
+
 	if (
 		!Array.isArray(raw.stages) ||
 		!raw.stages.length ||
@@ -197,12 +230,25 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 		throw new PlanError("plan_stages_invalid", "stages");
 	const earlier = new Map<string, JsonSchema>();
 	/** The schema the reference ends at (undefined past an open object or `anyOf`); throws on a bad path. */
+	/** The round a reference is read in: a first-round stage reads neither `$.round` nor a later-only stage. */
+	let reading: StageRound | "outputs" = "first";
+	const laterOnly = new Set<string>();
 	const checkRef = (
 		ref: Ref,
 		where: string,
 		upTo: ReadonlyMap<string, JsonSchema>,
 		own?: JsonSchema,
 	) => {
+		if (ref.root === "round") {
+			const start =
+				reading !== "first" && rounds && Object.hasOwn(rounds.inputs, ref.name)
+					? rounds.inputs[ref.name]
+					: undefined;
+			if (!start) throw new PlanError("ref_round_unknown", where);
+			return checkRefPath(ref, start, schemas, where);
+		}
+		if (ref.root === "stage" && reading === "first" && laterOnly.has(ref.name))
+			throw new PlanError("ref_stage_later_round", where);
 		const start =
 			ref.root === "inputs"
 				? Object.hasOwn(inputs, ref.name)
@@ -252,9 +298,24 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 				"ensure",
 				"maxOutputTokens",
 				"maxInputCharacters",
+				"session",
+				"cache",
+				"round",
 			],
 			where,
 		);
+		const round = item.round ?? "first";
+		if (round !== "first" && round !== "later" && round !== "every")
+			throw new PlanError("stage_round_invalid", `${where}.round`);
+		if (round !== "first" && !rounds)
+			throw new PlanError("plan_rounds_missing", `${where}.round`);
+		reading = round;
+		const stageSession = item.session ?? session.inherit;
+		if (stageSession !== "inherit" && stageSession !== "independent")
+			throw new PlanError("stage_session_invalid", `${where}.session`);
+		const cache = item.cache ?? session.cache;
+		if (typeof cache !== "boolean")
+			throw new PlanError("stage_cache_invalid", `${where}.cache`);
 		if (typeof item.id !== "string" || !namePattern.test(item.id))
 			throw new PlanError("stage_id_invalid", `${where}.id`);
 		if (earlier.has(item.id))
@@ -353,10 +414,17 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 			ensure,
 			maxOutputTokens: tokens,
 			maxInputCharacters: characters,
+			session: stageSession,
+			cache,
+			round,
 		};
 		earlier.set(stage.id, output);
+		if (round === "later") laterOnly.add(stage.id);
 		return stage;
 	});
+	if (rounds && !stages.some(({ round }) => round !== "first"))
+		throw new PlanError("plan_rounds_unused", "rounds");
+	reading = "outputs";
 
 	const outputs = Object.entries(record(raw.outputs, "outputs")).map(
 		([key, text]) => {
@@ -378,5 +446,57 @@ export function loadPlan(source: string | unknown): LoadedPlan {
 		inputSchema,
 		stages,
 		outputs,
+		rounds,
 	};
+}
+
+/** The plan's session defaults: every stage continues the run's session and its input cache unless it says not. */
+function sessionDefaults(raw: unknown): {
+	inherit: "inherit" | "independent";
+	cache: boolean;
+} {
+	if (raw === undefined) return { inherit: "inherit", cache: true };
+	if (!isObject(raw)) throw new PlanError("plan_session_invalid", "session");
+	only(raw, ["inherit", "cache"], "session");
+	const inherit = raw.inherit ?? true;
+	const cache = raw.cache ?? true;
+	if (typeof inherit !== "boolean" || typeof cache !== "boolean")
+		throw new PlanError("plan_session_invalid", "session");
+	return { inherit: inherit ? "inherit" : "independent", cache };
+}
+
+function loadRounds(
+	raw: unknown,
+	names: ReadonlySet<string>,
+	schemas: Readonly<Record<string, JsonSchema>>,
+	bounded: (schema: JsonSchema, where: string) => JsonSchema,
+): LoadedRounds | null {
+	if (raw === undefined) return null;
+	if (!isObject(raw)) throw new PlanError("plan_rounds_invalid", "rounds");
+	only(raw, ["max", "input"], "rounds");
+	if (
+		typeof raw.max !== "number" ||
+		!Number.isInteger(raw.max) ||
+		raw.max < 2 ||
+		raw.max > PLAN_LIMITS.rounds
+	)
+		throw new PlanError("plan_rounds_invalid", "rounds.max");
+	const inputs = Object.fromEntries(
+		Object.entries(record(raw.input, "rounds.input")).map(([name, value]) => [
+			name,
+			bounded(
+				checkSchema(value, `rounds.input.${name}`, names),
+				`rounds.input.${name}`,
+			),
+		]),
+	);
+	const inputSchema = z.strictObject(
+		Object.fromEntries(
+			Object.entries(inputs).map(([name, schema]) => [
+				name,
+				toZod(schema, schemas),
+			]),
+		),
+	) as unknown as z.ZodType<Record<string, unknown>>;
+	return { max: raw.max, inputs, inputSchema };
 }

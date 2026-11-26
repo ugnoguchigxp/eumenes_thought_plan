@@ -25,7 +25,10 @@ for (const scenario of scenarios)
 			ledger: createLedger(openLedgerStore(":memory:")),
 		});
 		expect(report.checks.filter(({ ok }) => !ok)).toEqual([]);
-		expect(report.modelCalls).toBe(scenario.ran.length);
+		expect(report.modelCalls).toBe(
+			scenario.ran.length +
+				(scenario.rounds ?? []).reduce((sum, { ran }) => sum + ran.length, 0),
+		);
 	});
 
 test("every stage schema converts to a strict structured-output format", () => {
@@ -47,6 +50,9 @@ test("the model settings parse and every configured model has a price", () => {
 	});
 	meter.record(config.model, { input: 1000, cached: 0, output: 1000 });
 	expect(() => meter.assertWithinLimit()).toThrow("llm_spend_limit");
+	const clamped = createSpendMeter(config);
+	clamped.record(config.model, { input: 100, cached: 500, output: 0 });
+	expect(clamped.summary().spentUsd).toBeGreaterThanOrEqual(0);
 });
 
 test("the API key comes from the exported variables only", () => {

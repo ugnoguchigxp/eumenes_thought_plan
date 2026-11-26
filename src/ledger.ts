@@ -62,6 +62,14 @@ ALTER TABLE thought_plan_stages ADD COLUMN retryable INTEGER;
 CREATE INDEX thought_plan_runs_latest ON thought_plan_runs (subject_ref, plan_digest, started_at_ms) WHERE subject_ref IS NOT NULL;
 `,
 	},
+	{
+		id: "thought-plan/0003-rounds",
+		after: ["thought-plan/0002-reuse-context"],
+		sql: `
+ALTER TABLE thought_plan_runs ADD COLUMN rounds INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE thought_plan_stages ADD COLUMN round INTEGER NOT NULL DEFAULT 1;
+`,
+	},
 ];
 
 export type LedgerMode = "full" | "off";
@@ -94,6 +102,8 @@ export type RunRow = {
 	readonly reusedRunId: string | null;
 	/** What the caller attached to the run (never passed to the model). */
 	readonly context: Record<string, unknown> | null;
+	/** Rounds the run has begun (1 for a run that was never continued). */
+	readonly rounds: number;
 };
 export type StageRow = {
 	readonly runId: string;
@@ -112,6 +122,8 @@ export type StageRow = {
 	readonly latencyMs: number | null;
 	/** For a failed stage: whether calling again with the same input may succeed (the model never answered). */
 	readonly retryable: boolean | null;
+	/** The round of the run the stage ran in (1 when not given). */
+	readonly round?: number;
 	readonly startedAtMs: number;
 	readonly finishedAtMs: number;
 };
@@ -152,7 +164,12 @@ export function beginRunInTransaction(
 	db: Database,
 	run: Omit<
 		RunRow,
-		"outputs" | "status" | "errorCode" | "finishedAtMs" | "reusedRunId"
+		| "outputs"
+		| "status"
+		| "errorCode"
+		| "finishedAtMs"
+		| "reusedRunId"
+		| "rounds"
 	>,
 ): void {
 	db.query(
@@ -176,7 +193,7 @@ export function beginRunInTransaction(
 /** A run that takes another run's conclusion: recorded complete at once, with no stages of its own. */
 export function recordReuseInTransaction(
 	db: Database,
-	run: Omit<RunRow, "status" | "errorCode" | "finishedAtMs"> & {
+	run: Omit<RunRow, "status" | "errorCode" | "finishedAtMs" | "rounds"> & {
 		reusedRunId: string;
 	},
 ): void {
@@ -271,8 +288,8 @@ export function recordStageInTransaction(db: Database, stage: StageRow): void {
 		throw new RunError(run ? "run_not_running" : "run_unknown");
 	db.query(
 		`INSERT INTO thought_plan_stages (run_id, seq, stage_id, status, skip_reason, input_json, system_digest, output_json,
-		  error_code, model, input_tokens, output_tokens, cache_read_tokens, latency_ms, started_at_ms, finished_at_ms, retryable)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		  error_code, model, input_tokens, output_tokens, cache_read_tokens, latency_ms, started_at_ms, finished_at_ms, retryable, round)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	).run(
 		stage.runId,
 		stage.seq,
@@ -291,7 +308,22 @@ export function recordStageInTransaction(db: Database, stage: StageRow): void {
 		stage.startedAtMs,
 		stage.finishedAtMs,
 		stage.retryable === null ? null : stage.retryable ? 1 : 0,
+		stage.round ?? 1,
 	);
+}
+
+/** Opens the next round of a completed run: it is running again, with one round more. */
+export function reopenRunInTransaction(
+	db: Database,
+	runId: string,
+	round: number,
+): void {
+	const changed = db
+		.query(
+			"UPDATE thought_plan_runs SET status = 'running', rounds = ?, finished_at_ms = NULL WHERE run_id = ? AND status = 'completed' AND rounds = ?",
+		)
+		.run(round, runId, round - 1).changes;
+	if (changed !== 1) throw new RunError("run_not_continuable");
 }
 
 export function finishRunInTransaction(
@@ -338,6 +370,7 @@ type RunDbRow = {
 	inputs_digest: string | null;
 	reused_run_id: string | null;
 	context_json: string | null;
+	rounds: number;
 };
 const runRow = (row: RunDbRow): RunRow => ({
 	runId: row.run_id,
@@ -355,6 +388,7 @@ const runRow = (row: RunDbRow): RunRow => ({
 	inputsDigest: row.inputs_digest,
 	reusedRunId: row.reused_run_id,
 	context: parsed(row.context_json) as Record<string, unknown> | null,
+	rounds: row.rounds,
 });
 
 export function readRunInTransaction(
@@ -404,6 +438,7 @@ export function readRunInTransaction(
 					: stage.retryable === 1,
 			startedAtMs: stage.started_at_ms as number,
 			finishedAtMs: stage.finished_at_ms as number,
+			round: stage.round as number,
 		}));
 	return {
 		run: runRow(row),

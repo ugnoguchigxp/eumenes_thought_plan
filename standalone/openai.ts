@@ -5,7 +5,7 @@ import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import type { Response } from "openai/resources/responses/responses";
 import { z } from "zod";
-import type { LlmPort } from "../src/llm";
+import type { LlmPort, LlmRequest } from "../src/llm";
 
 /**
  * The model settings: which model, how hard it thinks, and what it may spend. Model names live in this file
@@ -115,8 +115,9 @@ export function createSpendMeter(config: LlmConfig) {
 		) {
 			const rates = price(model);
 			calls++;
+			const uncached = Math.max(0, usage.input - usage.cached);
 			spentUsd +=
-				((usage.input - usage.cached) * rates.input +
+				(uncached * rates.input +
 					usage.cached * rates.cachedInput +
 					usage.output * rates.output) /
 				1_000_000;
@@ -127,13 +128,35 @@ export function createSpendMeter(config: LlmConfig) {
 export type SpendMeter = ReturnType<typeof createSpendMeter>;
 
 /**
- * The provider's prompt cache matches a prompt's leading tokens (from 1,024 on) and routes by this key. Calls
- * of the same stage share their instructions and output schema, so the stage's system context names the key:
- * those calls land on the same cache. There is no session: every stage is one stateless call that receives
- * its inputs explicitly.
+ * The provider's prompt cache matches a prompt's leading tokens (from 1,024 on) and routes by this key. A
+ * session's calls share their leading exchanges, so the session names the key; a call without a session is
+ * keyed by its system context. With the session's `cache` off, no key is sent.
  */
-export const promptCacheKey = (system: string) =>
-	`thought-plan:${createHash("sha256").update(system).digest("hex").slice(0, 32)}`;
+export const promptCacheKey = (text: string) =>
+	`thought-plan:${createHash("sha256").update(text).digest("hex").slice(0, 32)}`;
+
+/**
+ * The session as Responses API input: every earlier exchange (the stage's system context as a developer
+ * message, its input, the answer) and then this stage's. Each stage's system context sits at its own turn, so
+ * the leading exchanges stay the same from stage to stage and the cached prefix carries over.
+ */
+export function sessionInput(request: LlmRequest<unknown>) {
+	const turns = request.session?.turns ?? [];
+	return [
+		...turns.flatMap((turn) => [
+			{ role: "developer" as const, content: turn.system },
+			{ role: "user" as const, content: turn.prompt },
+			{ role: "assistant" as const, content: turn.output },
+		]),
+		{ role: "developer" as const, content: request.system },
+		{ role: "user" as const, content: request.prompt },
+	];
+}
+
+function cacheKey(request: LlmRequest<unknown>) {
+	if (!request.session) return promptCacheKey(request.system);
+	return request.session.cache ? promptCacheKey(request.session.id) : undefined;
+}
 
 const textOf = (response: Response) =>
 	response.output
@@ -182,9 +205,8 @@ export function createOpenAILlm(
 				const response = await client.responses.create(
 					{
 						model: config.model,
-						instructions: request.system,
-						input: request.prompt,
-						prompt_cache_key: promptCacheKey(request.system),
+						input: sessionInput(request),
+						...(cacheKey(request) && { prompt_cache_key: cacheKey(request) }),
 						store: false,
 						reasoning: { effort: config.effort },
 						max_output_tokens: Math.min(

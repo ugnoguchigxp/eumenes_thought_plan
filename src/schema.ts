@@ -191,8 +191,14 @@ export function resolveRef(
 	defs: Readonly<Record<string, JsonSchema>>,
 ): JsonSchema {
 	let current = schema;
-	for (let i = 0; current.$ref && i < 64; i++)
-		current = defs[refPattern.exec(current.$ref)![1]!]!;
+	const seen = new Set<string>();
+	while (current.$ref) {
+		const name = refPattern.exec(current.$ref)![1]!;
+		if (seen.has(name))
+			throw new PlanError("schema_ref_cycle", `schemas.${name}`);
+		seen.add(name);
+		current = defs[name]!;
+	}
 	return current;
 }
 

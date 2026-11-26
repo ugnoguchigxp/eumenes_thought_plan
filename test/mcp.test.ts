@@ -58,7 +58,7 @@ test("an agent lists, starts, submits and reads a run through MCP", async () => 
 		plans: { id: string }[];
 		invalid: unknown[];
 	};
-	expect(listed.plans.map(({ id }) => id)).toContain("review-judge-plan");
+	expect(listed.plans.map(({ id }) => id)).toContain("goal-pursuit");
 	expect(listed.invalid).toEqual([]);
 	const described = (await call("describe_plan", { planId: "two-stage" }))
 		.value;

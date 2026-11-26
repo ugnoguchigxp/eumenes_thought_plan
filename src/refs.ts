@@ -6,8 +6,8 @@ import { resolveRef, type JsonSchema } from "./schema";
  * at, then object keys, array indexes and, where allowed, `*` for every element of an array.
  */
 export type Ref = {
-	readonly root: "inputs" | "stage" | "output";
-	/** The input or stage name; empty for `output`. */
+	readonly root: "inputs" | "round" | "stage" | "output";
+	/** The input, round input or stage name; empty for `output`. */
 	readonly name: string;
 	readonly path: readonly Key[];
 };
@@ -23,10 +23,12 @@ export type RefOptions = {
 };
 
 const name = "[A-Za-z][A-Za-z0-9_-]*";
-const head = new RegExp(`^\\$\\.(?:(inputs|stages)\\.(${name})|(output))`);
+const head = new RegExp(
+	`^\\$\\.(?:(inputs|round|stages)\\.(${name})|(output))`,
+);
 const segment = new RegExp(`^(?:\\.(${name})|\\[(\\d+|\\*)\\])`);
 
-/** `$.inputs.<name>…`, `$.stages.<id>.output…` or `$.output…`, followed by `.key`, `[index]` and `[*]`. */
+/** `$.inputs.<name>…`, `$.round.<name>…`, `$.stages.<id>.output…` or `$.output…`, then `.key`, `[index]`, `[*]`. */
 export function parseRef(
 	text: unknown,
 	where: string,
@@ -36,7 +38,13 @@ export function parseRef(
 	const start = head.exec(text);
 	if (!start) throw new PlanError("ref_invalid", where);
 	let rest = text.slice(start[0].length);
-	const root = start[3] ? "output" : start[1] === "inputs" ? "inputs" : "stage";
+	const root = start[3]
+		? "output"
+		: start[1] === "inputs"
+			? "inputs"
+			: start[1] === "round"
+				? "round"
+				: "stage";
 	if (root === "output" && !options.output)
 		throw new PlanError("ref_invalid", where);
 	if (root === "stage") {
@@ -58,6 +66,8 @@ export function parseRef(
 /** What a reference reads from: the plan's inputs, the stages that ran, and the output being checked. */
 export type Scope = {
 	readonly inputs: Readonly<Record<string, unknown>>;
+	/** This round's input; absent in the first round, where `$.round…` reads null. */
+	readonly round?: Readonly<Record<string, unknown>>;
 	readonly stages: ReadonlyMap<string, { readonly output: unknown }>;
 	readonly output?: unknown;
 };
@@ -65,6 +75,10 @@ export type Scope = {
 function rootValue(ref: Ref, scope: Scope): unknown {
 	if (ref.root === "output") return scope.output ?? null;
 	if (ref.root === "stage") return scope.stages.get(ref.name)?.output ?? null;
+	if (ref.root === "round")
+		return scope.round && Object.hasOwn(scope.round, ref.name)
+			? scope.round[ref.name]
+			: null;
 	return Object.hasOwn(scope.inputs, ref.name)
 		? scope.inputs[ref.name]
 		: undefined;

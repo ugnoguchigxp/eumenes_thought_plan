@@ -24,6 +24,17 @@ export type Scenario = {
 	readonly skipped: readonly string[];
 	readonly fixture: Record<string, unknown>;
 	readonly checks: (result: RunResult) => readonly Check[];
+	/** Later rounds of the same run, in order: what the caller gives each, and what is expected of it. */
+	readonly rounds?: readonly ScenarioRound[];
+};
+
+/** A later round: the new input (what the executed step returned), the stages expected, and its checks. */
+export type ScenarioRound = {
+	readonly input: Record<string, unknown>;
+	readonly ran: readonly string[];
+	readonly skipped: readonly string[];
+	readonly fixture: Record<string, unknown>;
+	readonly checks?: (result: RunResult) => readonly Check[];
 };
 
 /** Reads a value of the run's outputs by dotted path (`plan.candidates.0.steps`). */

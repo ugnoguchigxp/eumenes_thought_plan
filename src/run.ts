@@ -7,12 +7,19 @@ import {
 	recordPlanInTransaction,
 	recordReuseInTransaction,
 	recordStageInTransaction,
+	reopenRunInTransaction,
 	type Ledger,
 	type RunStatus,
 	type StageRow,
 	type StageStatus,
 } from "./ledger";
-import type { InputContext, LlmPort, LlmResult } from "./llm";
+import type {
+	InputContext,
+	LlmPort,
+	LlmResult,
+	LlmSession,
+	SessionTurn,
+} from "./llm";
 import {
 	canonicalJson,
 	loadPlan,
@@ -50,6 +57,26 @@ export type RunResult = {
 	readonly stages: readonly StageResult[];
 	/** The run whose conclusion was reused without a model call (`reuse: "same_inputs"`). */
 	readonly reusedRunId: string | null;
+	/** The round this result ends (1 for the first). */
+	readonly round: number;
+	/** What the next round continues from; null unless the round completed. */
+	readonly state: RunState | null;
+};
+
+/**
+ * A completed round of a run, from which `continuePlan` runs the next one in the same session: the run, its
+ * inputs, the latest output of every stage, and the session's exchanges so far.
+ */
+export type RunState = {
+	readonly runId: string;
+	readonly planDigest: string;
+	readonly subjectRef: string | null;
+	readonly inputs: Record<string, unknown>;
+	readonly round: number;
+	readonly outputs: Readonly<Record<string, unknown>>;
+	readonly turns: readonly SessionTurn[];
+	/** The next stage record's sequence number. */
+	readonly seq: number;
 };
 
 export type RunOptions = {
@@ -203,6 +230,8 @@ async function reused(
 	)
 		return null;
 	const original = latest.reusedRunId ?? latest.runId;
+	const source = ledger.readRun(original);
+	if (!source) return null;
 	await ledger.write((db) => {
 		recordPlanInTransaction(db, plan, at);
 		recordReuseInTransaction(db, {
@@ -220,16 +249,16 @@ async function reused(
 			context: options.context ?? null,
 		});
 	});
-	const stages =
-		ledger
-			.readRun(original)
-			?.stages.filter(({ status }) => status !== "rejected")
-			.map((row): StageResult => ({
-				id: row.stageId,
-				status: row.status as StageResult["status"],
-				reason: row.skipReason ?? row.errorCode,
-				output: row.output,
-			})) ?? [];
+	const stages = source.stages
+		.filter(({ status }) => status !== "rejected")
+		.map((row): StageResult => ({
+			id: row.stageId,
+			status: row.status as StageResult["status"],
+			reason: row.skipReason ?? row.errorCode,
+			output: row.output,
+		}));
+	// A later round continues the run whose conclusion this is: its session is the one reused.
+	const state = stateOf(plan, source.run, source.stages);
 	return {
 		runId,
 		status: "completed",
@@ -238,12 +267,65 @@ async function reused(
 		outputs: latest.outputs,
 		stages,
 		reusedRunId: original,
+		round: state?.round ?? 1,
+		state,
 	};
 }
 
+/** The state a completed run left, rebuilt from its record; null when it cannot be continued. */
+function stateOf(
+	plan: LoadedPlan,
+	run: {
+		runId: string;
+		planDigest: string;
+		subjectRef: string | null;
+		inputs: Record<string, unknown>;
+		status: string;
+		rounds: number;
+	},
+	rows: readonly StageRow[],
+): RunState | null {
+	if (run.status !== "completed" || run.planDigest !== plan.digest) return null;
+	const byId = new Map(plan.stages.map((stage) => [stage.id, stage]));
+	const outputs: Record<string, unknown> = {};
+	const turns: SessionTurn[] = [];
+	for (const row of rows) {
+		if (row.status === "skipped") delete outputs[row.stageId];
+		if (row.status !== "ran") continue;
+		outputs[row.stageId] = row.output;
+		const stage = byId.get(row.stageId);
+		if (stage?.session === "inherit")
+			turns.push({
+				system: stage.system,
+				prompt: JSON.stringify(row.input),
+				output: JSON.stringify(row.output),
+			});
+	}
+	return {
+		runId: run.runId,
+		planDigest: run.planDigest,
+		subjectRef: run.subjectRef,
+		inputs: run.inputs,
+		round: run.rounds,
+		outputs,
+		turns,
+		seq: rows.reduce((next, { seq }) => Math.max(next, seq + 1), 0),
+	};
+}
+
+/** The state of a run as the ledger keeps it, for continuing it in another process; null if it cannot go on. */
+export function loadRunState(
+	plan: LoadedPlan,
+	ledger: Ledger,
+	runId: string,
+): RunState | null {
+	const read = ledger.readRun(runId);
+	return read ? stateOf(plan, read.run, read.stages) : null;
+}
+
 /**
- * Runs every stage in order with the model; stops at the first failed stage. The plan never loops and the
- * runner never calls again on its own. A stage is recorded once, after it settles. If the ledger fails midway,
+ * Runs the first round: every stage of it in order with the model, in one session; stops at the first failed
+ * stage. The plan never loops and the runner never calls again on its own; `continuePlan` runs a later round. A stage is recorded once, after it settles. If the ledger fails midway,
  * the run is closed as failed `ledger_write_failed` (one attempt) and the error is thrown.
  */
 export async function runPlan(
@@ -283,7 +365,23 @@ export async function runPlan(
 		});
 	});
 	try {
-		return await runStages(plan, checked, options, ledger, runId, now);
+		return await runRound(
+			plan,
+			{
+				runId,
+				planDigest: plan.digest,
+				subjectRef: options.subjectRef ?? null,
+				inputs: checked,
+				round: 0,
+				outputs: {},
+				turns: [],
+				seq: 0,
+			},
+			null,
+			options,
+			ledger,
+			now,
+		);
 	} catch (error) {
 		await ledger
 			.write((db) =>
@@ -299,16 +397,87 @@ export async function runPlan(
 	}
 }
 
-async function runStages(
+/**
+ * Runs the next round of a completed run in the same session: the stages that run in later rounds, with
+ * `$.round` set to `roundInput`. Past `rounds.max` it fails `rounds_exhausted` without a model call.
+ */
+export async function continuePlan(
 	plan: LoadedPlan,
-	inputs: Record<string, unknown>,
+	state: RunState,
+	roundInput: unknown,
+	options: RunOptions,
+): Promise<RunResult> {
+	const now = options.now ?? Date.now;
+	const ledger = options.ledger ?? createLedger(null, "off");
+	const stop = (code: string): RunResult => ({
+		runId: state.runId,
+		status: "failed",
+		errorCode: code,
+		failure: { stageId: "", code, retryable: false },
+		outputs: null,
+		stages: [],
+		reusedRunId: null,
+		round: state.round,
+		state: null,
+	});
+	if (!plan.rounds || state.planDigest !== plan.digest)
+		return stop("run_not_continuable");
+	if (state.round >= plan.rounds.max) return stop("rounds_exhausted");
+	const checked = plan.rounds.inputSchema.safeParse(roundInput);
+	if (!checked.success)
+		throw new RunError(
+			"round_input_invalid",
+			checked.error.issues
+				.map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+				.join("; "),
+		);
+	await ledger.write((db) =>
+		reopenRunInTransaction(db, state.runId, state.round + 1),
+	);
+	try {
+		return await runRound(plan, state, checked.data, options, ledger, now);
+	} catch (error) {
+		await ledger
+			.write((db) =>
+				finishRunInTransaction(db, state.runId, {
+					status: "failed",
+					outputs: null,
+					errorCode: "ledger_write_failed",
+					finishedAtMs: now(),
+				}),
+			)
+			.catch(() => undefined);
+		throw error;
+	}
+}
+
+const runsIn = (stage: LoadedStage, round: number) =>
+	stage.round === "every" || (stage.round === "first") === (round === 1);
+
+/**
+ * One round: the stages that run in it, in order, each continuing the run's session unless it is independent.
+ * `before` is the state the previous round left (round 0 for a new run); `roundInput` is null in the first.
+ */
+async function runRound(
+	plan: LoadedPlan,
+	before: RunState,
+	roundInput: Record<string, unknown> | null,
 	options: RunOptions,
 	ledger: Ledger,
-	runId: string,
 	now: () => number,
 ): Promise<RunResult> {
-	const stages = new Map<string, { output: unknown }>();
-	const scope: Scope = { inputs, stages };
+	const runId = before.runId;
+	const round = before.round + 1;
+	const stages = new Map<string, { output: unknown }>(
+		Object.entries(before.outputs).map(([id, output]) => [id, { output }]),
+	);
+	const scope: Scope = {
+		inputs: before.inputs,
+		...(roundInput && { round: roundInput }),
+		stages,
+	};
+	const turns = [...before.turns];
+	let seq = before.seq;
 	const results: StageResult[] = [];
 	const finish = async (
 		status: RunResult["status"],
@@ -331,6 +500,19 @@ async function runStages(
 			outputs,
 			stages: [...results],
 			reusedRunId: null,
+			round,
+			state:
+				status === "completed"
+					? {
+							...before,
+							round,
+							outputs: Object.fromEntries(
+								[...stages].map(([id, { output }]) => [id, output]),
+							),
+							turns,
+							seq,
+						}
+					: null,
 		};
 	};
 	const fail = async (
@@ -358,16 +540,18 @@ async function runStages(
 		});
 		return finish(cancelled ? "cancelled" : "failed", failure);
 	};
-	for (const [seq, stage] of plan.stages.entries()) {
+	for (const stage of plan.stages) {
+		if (!runsIn(stage, round)) continue;
 		const base: StageRow = {
 			...emptyStage,
 			runId,
-			seq,
+			seq: seq++,
 			stageId: stage.id,
 			status: "ran",
 			systemDigest: sha256(stage.system),
 			startedAtMs: now(),
 			finishedAtMs: 0,
+			round,
 		};
 		const reason = skipReason(stage, scope);
 		if (reason) {
@@ -379,6 +563,8 @@ async function runStages(
 					finishedAtMs: now(),
 				}),
 			);
+			// Skipped in this round: what it answered in an earlier round does not speak for this one.
+			stages.delete(stage.id);
 			results.push({ id: stage.id, status: "skipped", reason, output: null });
 			continue;
 		}
@@ -391,6 +577,15 @@ async function runStages(
 				{ stageId: stage.id, code: "stage_input_too_large", retryable: false },
 				base,
 			);
+		const prompt = JSON.stringify(input);
+		const session: LlmSession =
+			stage.session === "inherit"
+				? { id: runId, turns: [...turns], cache: stage.cache }
+				: {
+						id: `${runId}:${stage.id}:${round}`,
+						turns: [],
+						cache: stage.cache,
+					};
 		let receipt: LlmResult<unknown>;
 		try {
 			receipt = await abortable(
@@ -399,9 +594,10 @@ async function runStages(
 						{
 							purpose: "think",
 							system: stage.system,
-							prompt: JSON.stringify(input),
+							prompt,
 							schema: stage.outputSchema,
 							maxOutputTokens: stage.maxOutputTokens,
+							session,
 							...(options.llmInput && { input: options.llmInput }),
 						},
 						signal,
@@ -457,6 +653,12 @@ async function runStages(
 			}),
 		);
 		stages.set(stage.id, { output });
+		if (stage.session === "inherit")
+			turns.push({
+				system: stage.system,
+				prompt,
+				output: JSON.stringify(output),
+			});
 		results.push({ id: stage.id, status: "ran", reason: null, output });
 	}
 	return finish("completed", null);
@@ -625,6 +827,11 @@ export function createStepRunner(options: {
 		const plan = state.plan;
 		while (plan && !state.done && state.next < plan.stages.length) {
 			const stage = plan.stages[state.next]!;
+			// A stepwise run has one round: a stage of the later rounds is not part of it.
+			if (!runsIn(stage, 1)) {
+				state.next++;
+				continue;
+			}
 			const reason = skipReason(stage, scope);
 			const at = now();
 			const base = {
@@ -833,8 +1040,29 @@ export function createStepRunner(options: {
 				const code = checked.success
 					? "stage_output_inconsistent"
 					: "stage_output_invalid";
+				const characters = (JSON.stringify(output) ?? "").length;
+				const storedOutput =
+					characters > REJECTED_OUTPUT_CHARACTERS
+						? { omitted: "rejected_output_too_large", characters }
+						: output;
 				const refused = state.rejected.get(stageId) ?? 0;
 				if (refused >= REJECTIONS_PER_STAGE) {
+					await ledger.write((db) =>
+						recordStageInTransaction(db, {
+							...base,
+							output: storedOutput,
+							status: "failed",
+							errorCode: "stage_rejections_exceeded",
+							retryable: false,
+						}),
+					);
+					state.seq++;
+					state.results.push({
+						id: stage.id,
+						status: "failed",
+						reason: "stage_rejections_exceeded",
+						output: null,
+					});
 					state.done = {
 						status: "failed",
 						code: "stage_rejections_exceeded",
@@ -849,14 +1077,10 @@ export function createStepRunner(options: {
 					);
 					return advance(runId, state);
 				}
-				const characters = (JSON.stringify(output) ?? "").length;
 				await ledger.write((db) =>
 					recordStageInTransaction(db, {
 						...base,
-						output:
-							characters > REJECTED_OUTPUT_CHARACTERS
-								? { omitted: "rejected_output_too_large", characters }
-								: output,
+						output: storedOutput,
 						status: "rejected",
 						errorCode: code,
 					}),

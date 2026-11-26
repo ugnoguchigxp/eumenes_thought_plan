@@ -15,6 +15,7 @@ export {
 	recordPlanInTransaction,
 	recordReuseInTransaction,
 	recordStageInTransaction,
+	reopenRunInTransaction,
 	thoughtPlanMigrations,
 	type Ledger,
 	type LedgerMode,
@@ -24,13 +25,22 @@ export {
 	type RunRow,
 	type StageRow,
 } from "./ledger";
-export type { InputContext, LlmPort, LlmRequest, LlmResult } from "./llm";
+export type {
+	InputContext,
+	LlmPort,
+	LlmRequest,
+	LlmResult,
+	LlmSession,
+	SessionTurn,
+} from "./llm";
 export {
 	canonicalJson,
 	loadPlan,
 	PLAN_LIMITS,
 	type LoadedPlan,
+	type LoadedRounds,
 	type LoadedStage,
+	type StageRound,
 } from "./plan";
 export {
 	bundledPlans,
@@ -39,12 +49,15 @@ export {
 	scanPlanDirectory,
 } from "./plans";
 export {
+	continuePlan,
 	createStepRunner,
+	loadRunState,
 	runPlan,
 	type Rejection,
 	type RunFailure,
 	type RunOptions,
 	type RunResult,
+	type RunState,
 	type StageResult,
 	type StepView,
 } from "./run";

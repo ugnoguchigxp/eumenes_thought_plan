@@ -389,6 +389,7 @@ test("the new migration applies once to a ledger file made before it", () => {
 		).toEqual([
 			{ id: "thought-plan/0001-ledger" },
 			{ id: "thought-plan/0002-reuse-context" },
+			{ id: "thought-plan/0003-rounds" },
 		]);
 		again.close();
 	} finally {
@@ -538,7 +539,13 @@ test("refused submissions are bounded per stage, and large ones keep only their 
 	expect(
 		await runner.submit(started.runId, "judge", { decision: "maybe" }),
 	).toMatchObject({ status: "failed", code: "stage_rejections_exceeded" });
-	expect(ledger.readRun(started.runId)!.stages).toHaveLength(16);
+	const stages = ledger.readRun(started.runId)!.stages;
+	expect(stages.filter(({ status }) => status === "rejected")).toHaveLength(16);
+	expect(stages.at(-1)).toMatchObject({
+		status: "failed",
+		errorCode: "stage_rejections_exceeded",
+		retryable: false,
+	});
 });
 
 test("a finished stepwise run is read back from its record even if its plan no longer loads", async () => {
@@ -584,4 +591,106 @@ test("two submissions to the same stage at once move it on only once", async () 
 		status: "awaiting",
 		stage: { id: "plan" },
 	});
+});
+
+test("a stepwise run past its rejection limit stays failed across restart even when closing it fails", async () => {
+	const real = openLedgerStore(":memory:");
+	const ledger = createLedger(real);
+	const runner = createStepRunner({ ledger });
+	const started = await runner.start(plan, { question: "q", known: false });
+	for (let i = 0; i < 16; i++)
+		await runner.submit(started.runId, "judge", { decision: "maybe" });
+	// The 17th refusal writes the failed stage row, then fails when closing the run row.
+	let writes = 0;
+	const flaky: LedgerStore = {
+		read: (operation) => real.read(operation),
+		async write(operation) {
+			if (++writes === 2) throw new Error("disk full");
+			return real.write(operation);
+		},
+	};
+	const restarted = createStepRunner({ ledger: createLedger(flaky) });
+	await expect(
+		restarted.submit(started.runId, "judge", { decision: "maybe" }),
+	).rejects.toThrow("ledger_write_failed");
+	const afterCrash = createStepRunner({ ledger });
+	expect(await afterCrash.view(started.runId)).toMatchObject({
+		status: "failed",
+		code: "stage_rejections_exceeded",
+	});
+	expect(
+		await afterCrash.submit(started.runId, "judge", {
+			decision: "go",
+			reason: "ok",
+		}),
+	).toMatchObject({ status: "rejected", code: "stage_not_current" });
+});
+
+test("reuse falls back to a fresh run when the original run was pruned", async () => {
+	const store = openLedgerStore(":memory:");
+	const ledger = createLedger(store);
+	let clock = 1_000;
+	const { llm, calls } = fakeLlm(answers);
+	const inputs = { question: "q", known: false };
+	const options = {
+		llm,
+		ledger,
+		subjectRef: "goal:prune-reuse",
+		reuse: "same_inputs" as const,
+		now: () => clock,
+	};
+	const first = await runPlan(plan, inputs, options);
+	clock = 10_000;
+	const second = await runPlan(plan, inputs, options);
+	expect(second.reusedRunId).toBe(first.runId);
+	expect(calls).toHaveLength(2);
+	await store.write((db) =>
+		pruneRunsInTransaction(db, { finishedBeforeMs: 5_000 }),
+	);
+	expect(ledger.readRun(first.runId)).toBeNull();
+	clock = 20_000;
+	const third = await runPlan(plan, inputs, options);
+	expect(third.reusedRunId).toBeNull();
+	expect(third.stages.map(({ id }) => id)).toEqual(["judge", "plan"]);
+	expect(calls).toHaveLength(4);
+});
+
+test("canonicalJson omits undefined object properties and keeps plans readable from the ledger", async () => {
+	const { canonicalJson } = await import("../src/index");
+	expect(canonicalJson({ b: 1, a: undefined, c: [1, undefined] })).toBe(
+		'{"b":1,"c":[1,null]}',
+	);
+	const withUndefined = variant((p) => {
+		p.stages[0].description = undefined;
+	});
+	const loaded = loadPlan(withUndefined);
+	expect(loaded.digest).toBe(plan.digest);
+	const ledger = createLedger(openLedgerStore(":memory:"));
+	const result = await runPlan(
+		loaded,
+		{ question: "q", known: true },
+		{ llm: fakeLlm(answers).llm, ledger },
+	);
+	expect(ledger.readRun(result.runId)!.plan.id).toBe(plan.id);
+});
+
+test("non-cyclic $ref chains deeper than 64 resolve cleanly", async () => {
+	const schemas: Record<string, unknown> = {
+		s0: twoStagePlan.stages[0]!.output,
+	};
+	for (let i = 1; i <= 70; i++)
+		schemas[`s${i}`] = { $ref: `#/schemas/s${i - 1}` };
+	const deep = loadPlan({
+		...twoStagePlan,
+		schemas,
+		stages: [{ ...twoStagePlan.stages[0]!, output: { $ref: "#/schemas/s70" } }],
+		outputs: { decision: "$.stages.judge.output.decision" },
+	});
+	const result = await runPlan(
+		deep,
+		{ question: "q", known: false },
+		{ llm: fakeLlm(answers).llm },
+	);
+	expect(result.status).toBe("completed");
+	expect(result.outputs).toEqual({ decision: "go" });
 });

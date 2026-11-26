@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { bundledPlans, runPlan, type LoadedPlan } from "../src/index";
+import {
+	bundledPlans,
+	continuePlan,
+	runPlan,
+	type LoadedPlan,
+} from "../src/index";
 import { fakeLlm } from "./fixture";
 
 const plans = new Map(bundledPlans().map((plan) => [plan.id, plan]));
@@ -19,38 +24,49 @@ function byStage(plan: LoadedPlan, outputs: Record<string, unknown>) {
 
 test("four patterns ship, each loadable", () => {
 	expect([...plans.keys()].sort()).toEqual([
+		"goal-pursuit",
 		"impact-decision",
 		"plan-execute-replan",
 		"post-failure-reflection",
-		"review-judge-plan",
 	]);
 });
 
-const review = {
+const recall = {
 	done: ["実装を読んだ"],
 	learned: ["色の選択と保存がある"],
-	failures: [{ approach: "監督に試験を頼む", count: 7, cause: "入力上限" }],
-	changedSinceLast: [],
-	decision: "continue",
-	reason: "登録検査をまだ試していない",
-	wait: null,
-	question: null,
+	failures: [
+		{
+			approach: "監督に試験を頼む",
+			count: 7,
+			cause: "入力上限",
+			causeIn: "means",
+		},
+	],
 };
-const planOutput = {
+const judgment = (decision: string, extra: Record<string, unknown> = {}) => ({
+	criteria: [{ id: "root", state: "likely", basis: "実装がある" }],
+	decision,
+	reason: "登録検査をまだ試していない",
+	waitRef: null,
+	question: null,
+	missing: null,
+	...extra,
+});
+const procedure = {
 	candidates: [
 		{
-			approach: "登録検査を実行する",
+			approach: "登録検査で確かめる",
 			steps: [
 				{
-					capabilityRef: "check:1",
-					request: "検査を実行",
-					proceedWhen: "終了0",
+					kind: "verify",
+					checkRef: "check:1",
+					criterionId: "root",
+					evidenceRefs: [],
 				},
 			],
 			impact: {
 				changes: "none",
 				reversible: true,
-				inferenceCalls: 0,
 				minutes: 2,
 				ifFails: "理由が残る",
 			},
@@ -59,69 +75,86 @@ const planOutput = {
 	chosen: 0,
 	reason: "影響が小さい",
 };
-const goalInputs = (history: Record<string, unknown>) => ({
+const goalInputs = {
 	goal: {
-		text: "背景色を変えられる",
+		desiredState: "背景色を変えられる",
 		criteria: [{ id: "root", text: "設定から変えられる", status: "open" }],
 	},
-	history: { attempts: [], changes: [], ...history },
-	capabilities: [{ ref: "check:1", description: "登録検査", effect: "read" }],
+	history: [],
+	evidence: [],
+	capabilities: [],
+	checks: [{ ref: "check:1", description: "登録検査", criterionIds: ["root"] }],
+	waits: [{ ref: "later", condition: "時間を置く" }],
+	openQuestions: [],
+};
+const result = (outcome: string) => ({
+	since: [],
+	result: { step: "verify check:1", outcome, observed: "観測", evidence: [] },
 });
 
-test("review-judge-plan: after a failure it reviews and plans; after a success on a live plan it thinks nothing", async () => {
-	const plan = get("review-judge-plan");
-	const failed = byStage(plan, {
-		review,
-		keep: { keepPlan: false, reason: "残りの手は失敗した方法を含む" },
-		plan: planOutput,
+test("goal-pursuit: one session looks back, judges and devises; a later round thinks only when the result went wrong", async () => {
+	const plan = get("goal-pursuit");
+	const first = byStage(plan, {
+		recall,
+		judge: judgment("continue"),
+		devise: procedure,
 	});
-	const result = await runPlan(
-		plan,
-		goalInputs({ lastOutcome: "failed", planRemaining: true, changed: false }),
-		{ llm: failed.llm },
-	);
-	expect(failed.asked).toEqual(["review", "keep", "plan"]);
-	expect(result.outputs).toMatchObject({
-		decision: "continue",
-		plan: { chosen: 0 },
+	const started = await runPlan(plan, goalInputs, { llm: first.llm });
+	expect(first.asked).toEqual(["recall", "judge", "devise"]);
+	expect(started.outputs).toMatchObject({
+		judgment: { decision: "continue" },
+		procedure: { chosen: 0 },
+		reflection: null,
 	});
 
-	const succeeded = byStage(plan, {});
-	const skipped = await runPlan(
-		plan,
-		goalInputs({
-			lastOutcome: "succeeded",
-			planRemaining: true,
-			changed: false,
-		}),
-		{ llm: succeeded.llm },
-	);
-	expect(succeeded.asked).toEqual([]);
-	expect(skipped.outputs).toEqual({
-		review: null,
-		decision: null,
-		keepPlan: null,
-		plan: null,
+	const fine = byStage(plan, {});
+	const passed = await continuePlan(plan, started.state!, result("succeeded"), {
+		llm: fine.llm,
 	});
+	expect(fine.asked).toEqual([]);
+	expect(passed.outputs).toMatchObject({ procedure: null, reflection: null });
 
-	const changed = byStage(plan, {
-		review: {
-			...review,
-			decision: "wait",
-			wait: { until: "資料の到着", recheckAfterMinutes: 60 },
+	const wrong = byStage(plan, {
+		reflect: {
+			differed: "1件失敗",
+			cause: "保存色を読まない",
+			change: "起動時に読む",
+			decision: "replan",
+			waitRef: null,
+			question: null,
+			missing: null,
 		},
+		devise: procedure,
 	});
-	const waiting = await runPlan(
-		plan,
-		goalInputs({
-			lastOutcome: "succeeded",
-			planRemaining: true,
-			changed: true,
-		}),
-		{ llm: changed.llm },
-	);
-	expect(changed.asked).toEqual(["review"]);
-	expect(waiting.outputs).toMatchObject({ decision: "wait", plan: null });
+	const replanned = await continuePlan(plan, passed.state!, result("failed"), {
+		llm: wrong.llm,
+	});
+	expect(wrong.asked).toEqual(["reflect", "devise"]);
+	expect(replanned.outputs).toMatchObject({
+		reflection: { decision: "replan" },
+		procedure: { chosen: 0 },
+	});
+});
+
+test("goal-pursuit: waiting or asking devises nothing", async () => {
+	const plan = get("goal-pursuit");
+	const waits = byStage(plan, {
+		recall,
+		judge: judgment("wait", { waitRef: "later" }),
+	});
+	const waited = await runPlan(plan, goalInputs, { llm: waits.llm });
+	expect(waits.asked).toEqual(["recall", "judge"]);
+	expect(waited.outputs).toMatchObject({
+		judgment: { decision: "wait", waitRef: "later" },
+		procedure: null,
+	});
+	const unknownWait = byStage(plan, {
+		recall,
+		judge: judgment("wait", { waitRef: "nothing" }),
+	});
+	expect(
+		(await runPlan(plan, goalInputs, { llm: unknownWait.llm })).errorCode,
+	).toBe("stage_output_inconsistent");
 });
 
 test("plan-execute-replan: plans first, passes on success, replans only after a mismatch", async () => {
@@ -250,29 +283,4 @@ test("impact-decision: estimates every option, then chooses within the allowed e
 	);
 	expect(run.asked).toEqual(["estimate", "choose"]);
 	expect(result.outputs).toMatchObject({ decision: { chosen: "a" } });
-});
-
-test("review-judge-plan: with a plan left, a kept plan skips planning and a dropped one plans again", async () => {
-	const plan = get("review-judge-plan");
-	const inputs = goalInputs({
-		lastOutcome: "partial",
-		planRemaining: true,
-		changed: true,
-		remainingSteps: ["登録検査を実行する"],
-	});
-	const kept = byStage(plan, {
-		review,
-		keep: { keepPlan: true, reason: "残りの手はまだ有効" },
-	});
-	const keptResult = await runPlan(plan, inputs, { llm: kept.llm });
-	expect(kept.asked).toEqual(["review", "keep"]);
-	expect(keptResult.outputs).toMatchObject({ keepPlan: true, plan: null });
-
-	const dropped = byStage(plan, {
-		review,
-		keep: { keepPlan: false, reason: "前提が変わった" },
-		plan: planOutput,
-	});
-	await runPlan(plan, inputs, { llm: dropped.llm });
-	expect(dropped.asked).toEqual(["review", "keep", "plan"]);
 });

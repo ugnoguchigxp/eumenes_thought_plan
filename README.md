@@ -1,6 +1,6 @@
 # eumenes_thought_plan
 
-JSON で定義した「思考のプラン」を、段ごとに実行するパッケージです。各段は自分の system context・入力の配線・出力の JSON Schema を持ちます。推論なしで評価する条件により、考える必要のない段を省けます。すべての入力と出力は SQLite の台帳に記録できます（on/off 可）。
+JSON で定義した「思考のプラン」を、段ごとに実行するパッケージです。各段は自分の system context・入力の配線・出力の JSON Schema を持ちます。1回の実行は、最初の段から最後の段まで1つのモデルのセッションで、前の段のやり取りと入力キャッシュを引き継ぎます（段ごとに独立・キャッシュ off にもできる）。実行は次のラウンドとして、新しい入力（実行した手の結果など）を同じセッションで受け付けられます。推論なしで評価する条件により、考える必要のない段を省けます。すべての入力と出力は SQLite の台帳に記録できます（on/off 可）。
 
 - ライブラリとして使う場合は、LLM の呼び出し口を渡すと、各段をその LLM で進めます。
 - MCP サーバーとして使う場合、サーバーは推論しません。呼び出したコーディングエージェント自身が各段を考え、出力を渡します。サーバーはそれをスキーマで検査し、記録して次の段へつなぎます。
@@ -59,7 +59,9 @@ bun run verify   # 書式・lint・型・試験
 | 参照 | `$.inputs.<名前>…` か、その段より前の `$.stages.<段ID>.output…`。`.key` と `[index]` でたどる。閉じたオブジェクトの存在しないキーは読込み時に拒否する |
 | 出力スキーマ | LLM の構造化出力で使える範囲（`type`・`properties`・`required`・`additionalProperties: false`・`items`・`enum`・`const`・`anyOf`・`min/maxItems`・`min/maxLength`・`minimum`・`maximum`・`description`・`$ref`）。オブジェクトはすべてのプロパティを必須にし、閉じる |
 | 条件 | `equals`・`in`・`exists` と、`all`・`any`・`not` の組合せ。満たさない段は推論せずに省く。省いた段の出力を指す参照は `null` |
-| 繰り返し | プランの中にループはない。段は定義順に一度だけ通る。考え直しや次の周回は利用側が始める |
+| セッション | `session: { "inherit": true, "cache": true }` が既定。段の `session: "independent"` でその段だけ新しいセッション、`cache: false` で入力キャッシュを使わない。モデルの呼び出し口には `request.session = { id, turns, cache }`（それまでのやり取り）が渡る |
+| ラウンド | 段の `round` は `first`（既定）・`later`・`every`。`rounds: { "max": n, "input": {…} }` を持つプランは、`continuePlan` で次のラウンドを同じセッションで実行する。`$.round.<名前>` でそのラウンドの入力を読む。ラウンドの中で省いた段の出力はそのラウンドでは `null`。上限を超える続きは推論せずに `rounds_exhausted` |
+| 繰り返し | プランの中にループはない。各ラウンドで段は定義順に一度だけ通る。次のラウンドは利用側が結果を渡して始める |
 | 条件の値 | `equals`・`in` の値は、参照先のスキーマが取り得る値でなければ読込み時に拒否する（`condition_value_unreachable`）。書き間違いで段が黙って省かれ続けることはない |
 | 整合の規則 | 段の `ensure` に、出力がスキーマのほかに守る規則を書ける。出力を受け取った後に推論なしで検査し、破れば段を `stage_output_inconsistent` で止める |
 | 入力の上限 | 段の入力の JSON が `maxInputCharacters`（既定48,000字）を超えたら推論せずに `stage_input_too_large` で止める。入力を減らすのは利用側 |
@@ -91,7 +93,13 @@ const result = await runPlan(plan, { question: "…", known: false }, { llm, led
 // result.status, result.outputs, result.stages[i].status ("ran" | "skipped" | "failed")
 ```
 
-`llm` は `complete(request, signal)` を持つオブジェクトです（`request` は `purpose`・`system`・`prompt`・zod の `schema`・`maxOutputTokens`）。`eumenes-agency` の `LlmPort` と同じ形です。
+`llm` は `complete(request, signal)` を持つオブジェクトです（`request` は `purpose`・`system`・`prompt`・zod の `schema`・`maxOutputTokens`・`session`）。`eumenes-agency` の `LlmPort` と同じ形に `session` を足したものです。
+
+```ts
+// 次のラウンド: 同じセッションに、実行した手の結果だけを渡す
+const state = result.state ?? loadRunState(plan, ledger, result.runId);
+const next = await continuePlan(plan, state!, { since: [], result: { step: "…", outcome: "failed", observed: "…", evidence: [] } }, { llm, ledger });
+```
 
 | オプション | 内容 |
 | --- | --- |
@@ -139,7 +147,7 @@ claude mcp add thought-plan -- bun /path/to/eumenes_thought_plan/mcp/server.ts
 
 | プラン | 段 |
 | --- | --- |
-| `review-judge-plan` | 振り返りと継続の判断 → 方法の候補と影響の見積もり。前の手が成功し、計画が残り、前提が変わっていなければ両方省く |
+| `goal-pursuit` | 前回どこまで何をやったか → 達成しているか・続けられるか → 手順と影響の見積もり。以降のラウンドでは、結果が期待どおりなら推論0回、外れたときだけ振り返って手順を立て直す（上限4ラウンド） |
 | `plan-execute-replan` | 失敗・部分達成のときだけ結果を照合 → 計画・再計画 |
 | `post-failure-reflection` | 観測の整理 → 原因の仮説 → 次に変える条件 |
 | `impact-decision` | 選択肢ごとの影響の見積もり → 許された範囲での選択 |
@@ -165,14 +173,14 @@ bun run examples -- --repeat 30 --concurrency 4   # 測定: 各シナリオ30回
 bun run examples:fixture               # 各シナリオの固定の応答で、モデルなし（報告ファイルは書かない）
 ```
 
-シナリオは調整用（`tuning`、10件）と検証用（`heldout`、12件）に分けています。プランの指示文は調整用の不合格だけを見て直します。検証用はチューニングに使わず、測った数字をそのまま記録します。
+シナリオは調整用（`tuning`、10件）と検証用（`heldout`、12件）に分けています。2ラウンド以上のシナリオは、ラウンドごとの入力と期待を `rounds` に持ちます。プランの指示文は調整用の不合格だけを見て直します。検証用はチューニングに使わず、測った数字をそのまま記録します。
 
 | シナリオ | プラン | 見ること |
 | --- | --- | --- |
-| `live2d-goal-stalled` | review-judge-plan | 同じ方法が8回失敗した直後に、繰り返しを認め、まだ試していない登録検査を変更なしの方法として選ぶ |
+| `live2d-goal-pursuit` | goal-pursuit | 8回の失敗を認め、未試行の検査を変更なしの手順にする。検査が不具合で落ちたら同じセッションで改修の手順に立て直す。成功したラウンドは推論0回 |
+| `live2d-goal-already-done` | goal-pursuit | 実装済みなら改修せず、検査で確かめる手順にする |
 | `live2d-goal-reflection` | post-failure-reflection | 入力上限による失敗を以前と同じ失敗と認め、同じ依頼をそのまま再送しない |
-| `live2d-goal-on-plan` | review-judge-plan | 計画どおりなら推論0回 |
-| `goal-without-means` | review-judge-plan | 手段がなければ続けず、聞くか待つ |
+| `goal-without-means` | goal-pursuit | 手段がなければ続けず、聞くか待つ |
 | `readme-command-failed` / `readme-first-plan` | plan-execute-replan | 失敗後は対応する形式を確かめる計画に立て直す。初回は照合を省く |
 | `impact-undo-own-changes` / `impact-outside-limits` | impact-decision | 作業ツリー全体を消す手を選ばない。許可の外しかなければ確認を求める |
 | `triage-crash` / `triage-typo` | code-triage（`examples/plans/`） | 重大なら調査の段を通り、軽微なら省く |

@@ -45,7 +45,7 @@ const listing = run(["tar", "-tzf", join(out, file)]).split("\n");
 for (const required of [
 	"package/src/index.ts",
 	"package/mcp/server.ts",
-	"package/plans/review-judge-plan.json",
+	"package/plans/goal-pursuit.json",
 	"package/LICENSE",
 ])
 	if (!listing.includes(required))
